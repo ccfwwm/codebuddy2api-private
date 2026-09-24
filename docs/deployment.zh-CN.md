@@ -133,3 +133,11 @@ docker run -d --name codebuddy2api -p 127.0.0.1:8787:8787 \
 ## 验证
 
 `curl http://127.0.0.1:8787/health` 应返回 `{"status":"ok"}`。它只表示存活，不代表账号或模型可用；请在 WebUI 中查看。API 接入见[客户端配置](clients.zh-CN.md)，错误与重试边界见[进阶参考](advanced.zh-CN.md)。
+
+## Rakserver 生产部署
+
+私有部署仓库 `ccfwwm/codebuddy2api-private` 的 `main` 分支每次通过 CI 后，会构建并发布 GHCR 镜像，再通过受限 SSH 命令部署镜像摘要。服务器仅重建 `codebuddy2api` 容器，持久数据保存在 `/opt/codebuddy2api/auth`；GitHub Actions 不上传应用凭据。
+
+生产容器名为 `codebuddy2api`，加入 `sub2api-deploy_sub2api-network`。同一网络中的容器可用 `http://codebuddy2api:8787` 访问。宿主机只在 `127.0.0.1:8787` 发布端口，由 Nginx 提供 `https://qqapi.aicodeme.xyz`。
+
+WebUI 没有单独的用户名密码账号，使用 `CODEBUDDY2API_KEY` 登录。该密钥保存在服务器 `/opt/codebuddy2api/.env`，权限为 root-only；更换后需要用新密钥重新登录。账号凭证保存在 `auth/`，备份和升级时须保留整个目录。

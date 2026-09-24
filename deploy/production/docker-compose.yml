@@ -1,0 +1,48 @@
+services:
+  codebuddy2api:
+    image: ${CODEBUDDY2API_IMAGE:?CODEBUDDY2API_IMAGE is required}
+    container_name: codebuddy2api
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - /opt/codebuddy2api/auth:/data/auth
+    environment:
+      CODEBUDDY2API_KEY: ${CODEBUDDY2API_KEY:?CODEBUDDY2API_KEY is required}
+      CODEBUDDY_AUTH_DIR: /data/auth
+      CODEBUDDY_IMPORT_DIR: /data/auth/imports
+      CODEBUDDY2API_ALLOW_OPEN_NOAUTH: "false"
+      CODEBUDDY2API_ADMIN_CSRF: "true"
+      CODEBUDDY2API_ADMIN_ORIGINS: https://qqapi.aicodeme.xyz
+    command:
+      - python3
+      - converter.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8787"
+      - --skip-check
+      - --desensitize
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3)"
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+    networks:
+      - sub2api
+
+networks:
+  sub2api:
+    name: sub2api-deploy_sub2api-network
+    external: true
