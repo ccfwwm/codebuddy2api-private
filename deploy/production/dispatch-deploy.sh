@@ -15,4 +15,6 @@ exec systemd-run \
   --wait \
   --pipe \
   --property=Type=oneshot \
+  --setenv=HOME=/root \
+  --setenv=XDG_CONFIG_HOME=/root/.config \
   /usr/local/sbin/codebuddy2api-deploy-worker "$digest"
