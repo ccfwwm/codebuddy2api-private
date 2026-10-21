@@ -1,11 +1,14 @@
 name: Docker images
 
+# Documentation-only changes skip tests and images; tag pushes ignore path filters.
 on:
   pull_request:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'examples/**', 'LICENSE']
   push:
     branches: [main]
     tags: ['v*.*.*']
+    paths-ignore: ['**.md', 'docs/**', 'examples/**', 'LICENSE']
   workflow_dispatch:
 
 permissions:
@@ -44,6 +47,8 @@ jobs:
           done
 
   web:
+    # Tests run one after another so a backend failure stops the WebUI checks early.
+    needs: [test]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -88,9 +93,18 @@ jobs:
           vp exec playwright install --with-deps chromium-headless-shell
           vp exec playwright test
           vp exec playwright test -c playwright.integration.config.ts
+      - name: Upload WebUI build for the image and release archive
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
 
   image:
+    # Pull requests only run tests; images are built after merging to main or tagging.
     needs: [test, web]
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -103,6 +117,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Download WebUI build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: web-dist
+          path: web/dist
       - name: Set up QEMU
         uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
         with:
@@ -110,7 +129,7 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -121,14 +140,11 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/${{ github.repository }}
-          flavor: latest=auto
+          # Three published tags: the release version, edge for main, latest for releases.
           tags: |
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
-            type=ref,event=pr
-            type=sha
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
           labels: |
             org.opencontainers.image.version=${{ needs.test.outputs.version }}
       - name: Build and publish
@@ -136,14 +152,60 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
+          # Reuse the tested WebUI build instead of rebuilding it in the frontend stage.
+          build-contexts: webui=web/dist
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+          push: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Recorded in build.json so the Updates page can tell edge images from releases.
+          build-args: |
+            BUILD_CHANNEL=${{ startsWith(github.ref, 'refs/tags/v') && 'stable' || 'edge' }}
+            BUILD_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: mode=min
-          sbom: true
+          provenance: false
+          sbom: false
+
+  release:
+    needs: [image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download WebUI build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Package source archive
+        run: |
+          NAME="codebuddy2api-$(cat VERSION)"
+          git archive --format=tar --prefix="$NAME/" "$GITHUB_SHA" -o /tmp/src.tar
+          mkdir /tmp/pkg
+          tar -xf /tmp/src.tar -C /tmp/pkg
+          cp -r web/dist "/tmp/pkg/$NAME/web/dist"
+          tar -czf "$NAME.tar.gz" -C /tmp/pkg "$NAME"
+          sha256sum "$NAME.tar.gz" > SHA256SUMS
+      - name: Publish release assets
+        run: |
+          NAME="codebuddy2api-$(cat VERSION).tar.gz"
+          # Upload only: an existing release keeps its body untouched; a missing one
+          # gets a placeholder the maintainer edits into the real notes. view has no
+          # --verify-tag (only create/upload do), and its error stays in the log.
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
+              --notes "Automated assets for $GITHUB_REF_NAME; edit this body to add the release notes."
+          fi
+          gh release upload "$GITHUB_REF_NAME" "$NAME" "SHA256SUMS" --clobber
 
   deploy-production:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

@@ -1,6 +1,7 @@
 """Management views over the existing credential pool, without storing tokens."""
 
 import hashlib
+import re
 import time
 from pathlib import Path
 
@@ -8,7 +9,13 @@ from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.staticfiles import StaticFiles
 
-from . import checkin, model_policy, travel, trial_management
+from .background_jobs import JobBoard
+from . import (checkin, daily_chat, growth_chains, growth_events, growth_tasks, model_policy, model_rates,
+               output_probes, travel, trial_management)
+
+
+# One job per account: a second start while one runs returns the running job.
+GROWTH_JOBS = JobBoard()
 
 
 class Management:
@@ -26,6 +33,7 @@ class Management:
         pool._rescan()
         now = time.time()
         trials = trial_management.inventory(self.CONFIG.get("trial_ledger"))
+        daily_chats = self.CONFIG.get("control_store")
         with pool._lock:
             entries = {entry["id"]: entry for entry in pool.entries()}
             result = []
@@ -47,18 +55,26 @@ class Management:
                            auto_checkin=model_policy.credential_auto_checkin(self.CONFIG, entry),
                            checkin=checkin.view(balance.get("checkin") or {}),
                            auto_travel=model_policy.credential_auto_travel(self.CONFIG, entry),
-                           travel_supported=travel.supported(entry.get("profile")),
+                           travel_supported=travel.supported(entry.get("profile"), entry.get("enterprise") is True),
                            travel=balance.get("travel") or {"state": "unknown", "message": "尚未查询旅行状态"},
                            trial_supported=entry.get("profile") == "intl-work",
                            trial=(trial_management.view(trials.get(identity), now=now) if trials is not None
                                   else trial_management.failure("storage_error"))
                                  if entry.get("profile") == "intl-work" else trial_management.failure("not_applicable"),
+                           daily_chat_supported=daily_chat.supported(entry.get("profile")),
+                           auto_daily_chat=model_policy.credential_auto_daily_chat(self.CONFIG, entry),
+                           daily_chat=self._daily_chat_view(daily_chats, identity, now),
+                           growth_supported=growth_tasks.supported(entry.get("profile"), entry.get("enterprise") is True),
+                           auto_growth=model_policy.credential_auto_growth(self.CONFIG, entry),
+                           growth_auto=dict((daily_chats.snapshot()["credentials"].get(identity, {})
+                                             if daily_chats else {}) or {}).get("growth_auto") or {},
                            fail_until=until, cooldown_until=until,
                            cooldown_remaining=max(0, round(until - now)),
                            last_error_code=("http_401" if entry.get("last_error") == "backend HTTP 401" else
                                             "http_403" if entry.get("last_error") == "backend HTTP 403" else
                                             "credential_error" if entry.get("last_error") else None),
                            last_failure_at=entry.get("last_failure_at"),
+                           sync_error=(balance.get("error") or entry.get("last_error") or None),
                            cooldowns=cooldowns, credits=balance.get("credits") or None,
                            sync_pending=path in pool._sync_pending or path in pool._syncing or path in pool._sync_retry,
                            catalog_ready=(self.CONFIG.get("account_catalogs") or {}).get(identity, {}).get("models") is not None,
@@ -105,26 +121,209 @@ class Management:
             entry = next((entry for entry in pool.entries() if entry.get("account_key") == identity), None)
             if entry is None:
                 raise HTTPException(404, "凭证不存在")
-            if enabled and not travel.supported(entry.get("profile")):
-                raise HTTPException(400, "旅行仅适用于国内账号")
+            if enabled and not travel.supported(entry.get("profile"), entry.get("enterprise") is True):
+                raise HTTPException(400, "企业账号不参与成长中心，无法旅行"
+                                    if entry.get("enterprise") is True else "旅行仅适用于国内账号")
             self.CONFIG["control_store"].set_auto_travel(identity, enabled)
 
-    def admin_delete_guard(self, name):
+    def admin_set_auto_daily_chat(self, identity, enabled):
+        pool = self.CONFIG.get("cred_pool")
+        if pool is None:
+            raise HTTPException(404, "凭证不存在")
+        with pool._lock:
+            entry = next((entry for entry in pool.entries() if entry.get("account_key") == identity), None)
+            if entry is None:
+                raise HTTPException(404, "凭证不存在")
+            if enabled and not daily_chat.supported(entry.get("profile")):
+                raise HTTPException(400, "活跃打卡仅适用于国际 WorkBuddy 账号")
+            self.CONFIG["control_store"].set_auto_daily_chat(identity, enabled)
+        # Persist only: enabling never launches a turn; the sweep decides when to run it.
+
+    def admin_set_auto_growth(self, identity, enabled):
+        pool = self.CONFIG.get("cred_pool")
+        if pool is None:
+            raise HTTPException(404, "凭证不存在")
+        with pool._lock:
+            entry = next((entry for entry in pool.entries() if entry.get("account_key") == identity), None)
+            if entry is None:
+                raise HTTPException(404, "凭证不存在")
+            if enabled and not growth_tasks.supported(entry.get("profile"), entry.get("enterprise") is True):
+                raise HTTPException(400, "成长计划仅适用于国内个人账号")
+            self.CONFIG["control_store"].set_auto_growth(identity, enabled)
+        # Persist only: the sweep decides when to run; enabling never launches requests.
+
+    def admin_set_growth_auto(self, identity, mapping):
+        pool = self.CONFIG.get("cred_pool")
+        if pool is None:
+            raise HTTPException(404, "凭证不存在")
+        with pool._lock:
+            entry = next((entry for entry in pool.entries() if entry.get("account_key") == identity), None)
+            if entry is None:
+                raise HTTPException(404, "凭证不存在")
+            if any(mapping.get(code) for code in mapping) and \
+                    not growth_tasks.supported(entry.get("profile"), entry.get("enterprise") is True):
+                raise HTTPException(400, "成长计划仅适用于国内个人账号")
+            self.CONFIG["control_store"].set_growth_auto(identity, mapping)
+
+    def admin_growth_tasks(self, identity):
+        """Live dual-platform task list plus this account's automation switches."""
+        pool = self.CONFIG.get("cred_pool")
+        if pool is None:
+            raise HTTPException(404, "凭证不存在")
+        with pool._lock:
+            entry = next((entry for entry in pool.entries() if entry.get("account_key") == identity), None)
+            if entry is None:
+                raise HTTPException(404, "凭证不存在")
+            supported = growth_tasks.supported(entry.get("profile"), entry.get("enterprise") is True)
+            cm, generation = entry["cm"], entry["cm"]._generation
+        if not supported:
+            return {"supported": False, "auto_growth": False, "growth_auto": {}, "tasks": [],
+                    "message": "成长计划仅适用于国内个人账号"}
+        with cm._lock:
+            headers = cm.get_headers()
+        if not pool.apply_if_current(cm, generation, lambda: None):
+            return {"supported": True, "stale": True, "auto_growth": False, "growth_auto": {},
+                    "tasks": [], "message": "凭证已变化，请刷新核验"}
+        token = self.gateway._bearer_token(headers)
+        tasks = growth_tasks.merged_tasks(token, uid=headers.get("X-User-Id", ""),
+                                          domain=headers.get("X-Domain", ""))
+        state = self.CONFIG.get("control_store").snapshot()["credentials"].get(identity, {}) or {}
+        for task in tasks:
+            # Only codes with a chain can be switched or run; others are left to the claim sweep.
+            task["automatable"] = task["task_code"] in growth_chains.RUNNERS
+        return {"supported": True, "auto_growth": model_policy.credential_auto_growth(self.CONFIG, entry),
+                "growth_auto": dict(state.get("growth_auto") or {}), "tasks": tasks}
+
+    def _growth_chain_context(self, identity):
+        """Build the chain context or raise 404/400; caller releases nothing (run() self-locks)."""
+        from .site_routing import PROFILE_ENDPOINTS, profile_for_headers
+        pool = self.CONFIG.get("cred_pool")
+        if pool is None:
+            raise HTTPException(404, "凭证不存在")
+        with pool._lock:
+            entry = next((entry for entry in pool.entries() if entry.get("account_key") == identity), None)
+            if entry is None:
+                raise HTTPException(404, "凭证不存在")
+            if not growth_tasks.supported(entry.get("profile"), entry.get("enterprise") is True):
+                raise HTTPException(400, "成长计划仅适用于国内个人账号")
+            if not model_policy.credential_enabled(self.CONFIG, entry):
+                raise HTTPException(400, "账号已人工停用")
+            cm, generation = entry["cm"], entry["cm"]._generation
+            summary = cm.summary()
+        with cm._lock:
+            headers = cm.get_headers()
+        if not pool.apply_if_current(cm, generation, lambda: None):
+            raise HTTPException(409, "凭证已变化，请刷新核验后重试")
+        token = self.gateway._bearer_token(headers)
+        profile = profile_for_headers(headers)
+        return growth_chains.Context(
+            base=PROFILE_ENDPOINTS[profile], token=token, uid=headers.get("X-User-Id", ""),
+            domain=headers.get("X-Domain", ""),
+            nickname=(summary.get("email") or "").split("@")[0],
+            headers=headers, lock_key=identity)
+
+    @staticmethod
+    def _run_growth_chain(code, ctx):
+        """Upstream failures become a readable outcome instead of an opaque 400."""
+        try:
+            return growth_chains.run(code, ctx)
+        except (growth_tasks.Failure, growth_events.Failure) as error:
+            return {"ok": False, "message": f"执行失败：{error}"}
+
+    def _start_growth_job(self, identity, ctx, codes, tasks, kind):
+        """Run task chains one by one in the background; the banner shows the current task."""
+        titles = {task["task_code"]: task.get("title") or task["task_code"] for task in tasks or ()}
+
+        def run(code, _progress):
+            return {"task_code": code, "title": titles.get(code, code), **self._run_growth_chain(code, ctx)}
+        return GROWTH_JOBS.start(f"growth:{identity}", codes, run, meta={"account": identity, "kind": kind},
+                                 label=lambda code: {"task_code": code, "title": titles.get(code, code)})
+
+    @staticmethod
+    def _growth_task_list(ctx):
+        try:
+            return growth_tasks.merged_tasks(ctx.token, ctx.uid, ctx.domain)
+        except growth_tasks.Failure:
+            return None
+
+    def admin_growth_auto(self, identity, task_code):
+        """Start one task chain manually, regardless of its automation switch."""
+        if task_code not in growth_chains.RUNNERS:
+            raise HTTPException(400, "该任务暂无自动链")
+        ctx = self._growth_chain_context(identity)
+        return self._start_growth_job(identity, ctx, [task_code], self._growth_task_list(ctx), "single")
+
+    def admin_growth_auto_all(self, identity):
+        """Start every task whose switch is on, or every open task when none is switched on.
+
+        A manual run ignores the scheduled master switch.
+        """
+        ctx = self._growth_chain_context(identity)
+        state = self.CONFIG["control_store"].snapshot()["credentials"].get(identity, {}) or {}
+        enabled = sorted(code for code, on in (state.get("growth_auto") or {}).items()
+                         if on is True and code in growth_chains.RUNNERS)
+        tasks = self._growth_task_list(ctx)
+        if not enabled:
+            if tasks is None:
+                raise HTTPException(502, "成长任务列表获取失败")
+            enabled = [task["task_code"] for task in tasks if task["task_code"] in growth_chains.RUNNERS
+                       and not task["claimed"] and not task["locked"]]
+        return self._start_growth_job(identity, ctx, enabled, tasks, "all")
+
+    @staticmethod
+    def admin_growth_jobs():
+        """Every account's current or last growth job, for the progress banner."""
+        return GROWTH_JOBS.views("growth:")
+
+    @staticmethod
+    def _daily_chat_view(store, identity, now):
+        """Today's turn state, or the availability prompt when nothing is recorded yet."""
+        if store is None:
+            return daily_chat.failure_view()
+        try:
+            record = store.daily_chat_record(identity, daily_chat.today(now))
+        except Exception:
+            return daily_chat.failure_view()
+        return daily_chat.view(record)
+
+    def admin_delete_guard(self, name, *, unbind=False):
+        """Block a still-bound delete, or return the identity to unbind after removal."""
         rows = self.admin_credential_inventory()
         row = next((row for row in rows if row["name"] == name or row["id"] == name), None)
-        if row and row["bindings"]:
+        if row is None or not row["bindings"]:
+            return None
+        if not unbind:
             raise HTTPException(status_code=409, detail={"message": "凭证仍被模型规则引用，请先移除绑定",
                                                         "models": row["bindings"]})
+        return row["id"]
+
+    def admin_unbind_credential(self, identity):
+        """Unbind now and return the rollback record used when removal fails."""
+        control = self.CONFIG.get("control_store")
+        if control is None:
+            return {}
+        return {"identity": identity, "rules": control.unbind_credential(identity)}
+
+    def admin_restore_bindings(self, rollback):
+        """Put bindings back after a failed removal so routing never widens silently."""
+        control = self.CONFIG.get("control_store")
+        if control is not None:
+            control.restore_bindings(rollback["identity"], rollback["rules"])
 
     def admin_model_inventory(self):
         pool = self.CONFIG.get("cred_pool")
         if pool:
             pool._rescan()
-        facts = {}
+        model_rates.refresh(self.gateway, max_age=model_rates.REFRESH_MAX_AGE_S)
+        facts, served, declared = {}, {}, {}
         for account in (self.CONFIG.get("account_catalogs") or {}).values():
             for item in self.gateway._usable_models(
                     self.gateway._effective_account_scope(account, "serves") or []):
                 source = item["id"]
+                served.setdefault(source, set()).add(account["profile"])
+                if "credits_source" in item:
+                    declared.setdefault(source, {})[account["profile"]] = \
+                        self.gateway._multiplier_value(item.get("credits_declared"))
                 row = facts.setdefault(source, {"id": source, "credits": None, "credits_by_profile": {}})
                 price = self.gateway._multiplier_value(item.get("credits"))
                 if price is not None:
@@ -142,10 +341,29 @@ class Management:
             metadata = self.gateway.model_capabilities.route_metadata(
                 self.gateway, rule["upstream_id"], rule=rule, include_disabled=True)
             prices = self.gateway.model_capabilities.declaration_prices(self.gateway, metadata)
-            result.append({**target, **metadata, **prices, **rule, "id": source,
+            upstream = rule["upstream_id"]
+            rates = model_rates.details(self.gateway, upstream, sorted(served.get(upstream, ())))
+            for profile, value in (declared.get(upstream) or {}).items():
+                rates[profile]["declared"] = value
+            result.append({**target, **metadata, **prices, **rule, "id": source, "rate_details": rates,
                            "available_credentials": len(preview["candidates"]),
                            "available": bool(preview["candidates"])})
         return sorted(result, key=lambda row: row["id"])
+
+    def admin_rate_probe_model(self, source):
+        """Probe one rule's upstream model on every product that serves it, in the background."""
+        upstream = model_policy.rule_for(self.CONFIG, source)["upstream_id"]
+        return model_rates.start_probe(self.gateway, upstream, scope=source)
+
+    def admin_rate_probe_all(self):
+        return model_rates.start_probe(self.gateway)
+
+    def admin_rate_probe_view(self):
+        return model_rates.job_view(self.gateway)
+
+    def admin_output_probes(self):
+        control = self.CONFIG.get("control_store")
+        return output_probes.read(output_probes.default_path(control.path if control is not None else None))
 
     def admin_model_preview(self, source, rule):
         upstream = rule.get("upstream_id", source)
@@ -202,7 +420,9 @@ class Management:
 def install_pages(app, directory):
     """Fallback only applies to pages; management/client APIs never serve HTML."""
     root = Path(directory).resolve()
-    pages = {"", "models", "credentials", "logs", "settings", "login"}
+    pages = {"", "models", "credentials", "logs", "storage", "settings", "updates", "login"}
+    # Release detail pages carry the tag, whose dots would otherwise read as a file suffix.
+    release_page = re.compile(r"updates/v\d+\.\d+\.\d+").fullmatch
     assets = StaticFiles(directory=root / "assets", check_dir=False)
 
     @app.api_route("/dashboard/assets/{asset_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
@@ -220,7 +440,7 @@ def install_pages(app, directory):
     def dashboard_page(page=""):
         if page == "assets" or page.startswith("assets/"):
             return JSONResponse({"detail": "Not Found"}, status_code=404)
-        if page not in pages:
+        if page not in pages and not release_page(page):
             if Path(page).suffix:
                 return JSONResponse({"detail": "Not Found"}, status_code=404)
             return RedirectResponse("/dashboard", status_code=302)

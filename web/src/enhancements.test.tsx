@@ -7,6 +7,15 @@ import { Trend } from "./Trend";
 import { Credentials } from "./pages/Credentials";
 import { api, useResource } from "./api";
 
+function openRowMenu(credentialName: string) {
+  const row = screen
+    .getAllByText(credentialName)
+    .map((el) => el.closest<HTMLElement>("tr, article"))
+    .find((tr) => tr && within(tr).queryByRole("button", { name: /^更多/ }));
+  if (!row) throw new Error(`row for ${credentialName} not found`);
+  fireEvent.click(within(row).getByRole("button", { name: /^更多/ }));
+}
+
 vi.mock("./api", async (original) => ({
   ...(await original<typeof import("./api")>()),
   useResource: vi.fn(),
@@ -159,6 +168,7 @@ describe("scoped credential buttons", () => {
       data: [{ id: "one", name: "one.info", enabled: true, profile: "cn-cli", health: "ready" }],
       reload: vi.fn(),
       loading: false,
+      refreshing: false,
       error: null,
     });
     const post = vi.spyOn(api, "post").mockResolvedValue({
@@ -173,6 +183,13 @@ describe("scoped credential buttons", () => {
       ["批量签到", "/checkin"],
       ["同步全部余额", "/sync"],
     ]) {
+      if (
+        label.startsWith("刷新凭证 ") ||
+        label.startsWith("签到 ") ||
+        label.startsWith("清除冷却 ")
+      )
+        openRowMenu("one.info");
+      if (label === "批量签到") fireEvent.click(screen.getByRole("button", { name: "批量操作" }));
       await act(async () => fireEvent.click(screen.getByRole("button", { name: label })));
       expect(post).toHaveBeenLastCalledWith(
         path,
@@ -192,6 +209,7 @@ describe("scoped credential buttons", () => {
       ],
       reload: vi.fn(),
       loading: false,
+      refreshing: false,
       error: null,
     });
     const post = vi.spyOn(api, "post").mockResolvedValue({
@@ -209,6 +227,7 @@ describe("scoped credential buttons", () => {
       },
     });
     render(<Credentials />);
+    openRowMenu("one.info");
     const button = screen.getByRole("button", { name: "清除冷却 one.info" });
     expect((button as HTMLButtonElement).disabled).toBe(false);
     await act(async () => fireEvent.click(button));

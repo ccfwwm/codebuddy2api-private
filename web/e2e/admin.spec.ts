@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { choose } from "./select";
 const model = {
   id: "mock-model",
   public_id: "mock-model",
@@ -198,7 +199,10 @@ test("isolated dashboard, deep routes, model conflict and schema settings", asyn
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await page.getByRole("link", { name: "系统设置" }).click();
+  // Externally locked items live behind their own tab now.
+  await page.getByRole("tab", { name: /外部锁定/ }).click();
   await expect(page.getByText("外部锁定", { exact: true })).toBeVisible();
+  await page.getByRole("tab", { name: /可修改/ }).click();
   await page.getByLabel("审计明细保留天数").fill("60");
   await page.getByRole("button", { name: "保存更改" }).click();
   await expect
@@ -226,6 +230,7 @@ test("credential OAuth terminates, upload/export and safe-name deletion are wire
   await page.waitForTimeout(4500);
   expect(mock.getPolls()).toBe(1);
   await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "批量操作" }).click();
   await page.getByRole("button", { name: "导入文件" }).click();
   await page.getByLabel("选择 .info 或 ZIP").setInputFiles({
     name: "import.info",
@@ -264,6 +269,26 @@ test("credential OAuth terminates, upload/export and safe-name deletion are wire
     )
     .toBe(true);
 });
+test("deleting a bound credential confirms the automatic unbind", async ({ page }) => {
+  const mock = await mockAPI(page);
+  await page.route("**/admin/credentials", async (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    return route.fulfill({ json: { credentials: [{ ...credential, bindings: ["mock-model"] }] } });
+  });
+  await page.goto("/dashboard/credentials");
+  await page.getByRole("button", { name: "删除", exact: true }).click();
+  await expect(page.getByText("该凭证仍被模型规则引用：mock-model。")).toBeVisible();
+  await expect(page.getByText("确认后将自动解除这些绑定，规则回退为自动选择账号。")).toBeVisible();
+  await page.getByRole("button", { name: "解除绑定并删除凭证" }).click();
+  await expect
+    .poll(() =>
+      mock.calls.some(
+        (call) =>
+          call.method === "DELETE" && call.path === "/admin/credentials/mock-account.info?unbind=1",
+      ),
+    )
+    .toBe(true);
+});
 test("international OAuth choices send distinct sites and show the selected official host", async ({
   page,
 }) => {
@@ -271,13 +296,13 @@ test("international OAuth choices send distinct sites and show the selected offi
   await page.goto("/dashboard/credentials");
   await page.getByRole("button", { name: "添加凭证" }).click();
   const select = page.getByLabel("登录站点");
-  await expect(select).toHaveValue("cn");
+  await expect(select).toHaveText("中国大陆 · CN");
   for (const [site, label, host] of [
     ["intl", "国际 · WorkBuddy", "www.workbuddy.ai"],
     ["intl-codebuddy", "国际 · CodeBuddy", "www.codebuddy.ai"],
   ]) {
-    await select.selectOption({ label });
-    await expect(select).toHaveValue(site);
+    await choose(select, site);
+    await expect(select).toHaveText(label);
     await page.getByRole("button", { name: "发起 OAuth 授权" }).click();
     await expect(page.getByRole("link", { name: /打开官方授权页面/ })).toHaveAttribute(
       "href",
@@ -301,7 +326,7 @@ test("log tabs, cursor, details and guarded destructive clear", async ({ page })
   await expect(page.getByText("mock.operation")).toBeVisible();
   await page.getByRole("tab", { name: "管理操作" }).click();
   await page.getByRole("button", { name: "清理日志" }).click();
-  await page.getByLabel("清理范围").selectOption("all");
+  await choose(page.getByLabel("清理范围"), "all");
   await expect(page.getByRole("button", { name: "确认不可撤销的清理" })).toBeDisabled();
   await page.getByLabel("输入“清空全部日志与统计”").fill("清空全部日志与统计");
   await page.getByLabel("当前 API key").fill("mock-revalidation-key");

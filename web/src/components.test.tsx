@@ -5,6 +5,7 @@ import { AppRoutes, Guard } from "./App";
 import { api, useSession, type ModelRule } from "./api";
 import { CLEAR_CONFIRMATION, ClearLogs } from "./components";
 import { ModelEditor, validateRule } from "./pages/Models";
+import { choose } from "./test-utils";
 const rule: ModelRule = {
   id: "upstream",
   public_id: "public",
@@ -97,7 +98,7 @@ describe("destructive warnings", () => {
   it("blocks full clear until exact phrase and current key, and clears key after submit", async () => {
     const post = vi.spyOn(api, "post").mockResolvedValue({ data: { ok: true } });
     render(<ClearLogs onClose={vi.fn()} onDone={vi.fn()} />);
-    fireEvent.change(screen.getByLabelText("清理范围"), { target: { value: "all" } });
+    choose(screen.getByLabelText("清理范围"), "all");
     const submit = screen.getByRole("button", { name: "确认不可撤销的清理" });
     expect(submit).toHaveProperty("disabled", true);
     expect(screen.getByText(/将永久删除全部请求明细/)).toBeTruthy();

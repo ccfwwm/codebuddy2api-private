@@ -12,7 +12,73 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app.audit_store import AuditStore, _CLEANUP_BATCH
+from app.audit_store import SCHEMA_VERSION, AuditStore, _CLEANUP_BATCH
+
+
+class ArchiveAndStorageStatsTests(unittest.TestCase):
+    """Archive exports old rows before deleting them; storage reports reclaimable pages."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / "audit.sqlite3"
+        self.store = AuditStore(self.path)
+
+    def tearDown(self):
+        self.store.close()
+        self.temp.cleanup()
+
+    def record(self, id, started_at, duration_ms=100):
+        return {"id": id, **self.store.ticket(), "started_at": started_at,
+                "public_model": "m", "upstream_model": "u", "profile": "p",
+                "credential": "c", "protocol": "chat", "status_code": 200,
+                "duration_ms": duration_ms, "outcome": "success"}
+
+    def test_archive_exports_then_deletes_and_keeps_recent_rows(self):
+        old = time.time() - 10 * 86400
+        self.store.record_request(self.record("old", old, duration_ms=200))
+        self.store.record_request(self.record("new", time.time(), duration_ms=100))
+        self.store.event("runtime", "rotate", {"note": "old"})
+        self.assertEqual(self.store.dashboard(30)["summary"]["p95_duration_ms"], 200)
+        result = self.store.archive(7)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["archived_requests"], 1)
+        self.assertEqual(result["archived_events"], 0)  # the event is fresh
+        archive = self.path.parent / "archives" / result["file"]
+        lines = archive.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["id"], "old")
+        self.assertEqual(oct(archive.stat().st_mode & 0o777), "0o600")
+        self.assertIsNone(self.store.get_request("old"))
+        self.assertIsNotNone(self.store.get_request("new"))
+        # Aggregates survive, replay dedup stays intact, and partial detail samples hide P95.
+        replay = self.store.record_request(self.record("old", old, duration_ms=200))
+        self.assertEqual(replay, {"ok": True, "recorded": False, "reason": "duplicate"})
+        summary = self.store.dashboard(30)["summary"]
+        self.assertEqual(summary["requests"], 2)
+        self.assertIsNone(summary["p95_duration_ms"])
+
+    def test_archive_empty_window_is_a_noop_without_a_file(self):
+        self.store.record_request(self.record("fresh", time.time()))
+        result = self.store.archive(7)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["archived_requests"], 0)
+        self.assertIsNone(result["file"])
+        self.assertFalse((self.path.parent / "archives").exists())
+
+    def test_archive_rejects_invalid_windows(self):
+        for days in (0, -1, 3651, 1.5, "30", True):
+            with self.assertRaises(ValueError):
+                self.store.archive(days)
+
+    def test_storage_reports_reclaimable_bytes(self):
+        storage = self.store.storage()
+        self.assertIn("reclaimable_bytes", storage)
+        self.assertGreaterEqual(storage["reclaimable_bytes"], 0)
+        self.assertGreater(storage["page_count"], 0)
+        for _ in range(50):
+            self.store.record_request(self.record(f"bulk-{_}", time.time()))
+        self.store.clear("details")
+        self.assertGreater(self.store.storage()["reclaimable_bytes"], 0)
 
 
 class AuditStoreTests(unittest.TestCase):
@@ -94,7 +160,7 @@ class AuditStoreTests(unittest.TestCase):
         self.store.record_request(self.record(input_tokens=0))
         self.store.clear("details")
         with closing(sqlite3.connect(self.path)) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             for table in ("stats_hourly", "stats_daily", "stats_totals"):
                 rows = db.execute(f"SELECT dimension,payload FROM {table}").fetchall()
                 self.assertEqual({r[0] for r in rows}, {"global", "model", "profile", "credential"})
@@ -126,15 +192,121 @@ class AuditStoreTests(unittest.TestCase):
         self.assertEqual(self.store.storage()["ingest_count"], 0)
         self.assertTrue(self.store.storage()["degraded"])
 
-    def test_thread_lock_timeout_is_visible(self):
+    def test_thread_lock_timeout_is_transient_not_degraded(self):
+        # Contention is expected under load; it must never latch the 24h banner.
         record = self.record()
         with self.store._lock:
             start = time.monotonic()
             result = self.store.record_request(record)
         self.assertLess(time.monotonic() - start, 1)
         self.assertFalse(result["ok"])
-        self.assertEqual(self.store.storage()["last_error"], "TimeoutError")
+        health = self.store.storage()
+        self.assertFalse(health["degraded"])
+        self.assertEqual(health["transient_contention"], 1)
+        self.assertEqual(health["dropped_records"], 1)
+        self.assertIsNone(health["last_error"])
 
+    def test_transient_fault_degrades_only_within_window(self):
+        with patch.object(self.store, "_aggregate", side_effect=sqlite3.OperationalError("boom")):
+            self.assertFalse(self.store.record_request(self.record())["ok"])
+        health = self.store.storage()
+        self.assertTrue(health["degraded"])
+        self.assertEqual(health["recent_failures"], 1)
+        self.assertEqual(health["failure_count"], 1)
+        self.assertGreater(health["last_failure_at"], 0)
+        # 窗口之外：横幅消失，但终身计数与最近异常仍如实保留。
+        self.store.failure_events = [time.monotonic() - 25 * 3600]
+        health = self.store.storage()
+        self.assertFalse(health["degraded"])
+        self.assertEqual(health["recent_failures"], 0)
+        self.assertEqual(health["failure_count"], 1)
+        self.assertEqual(health["dropped_records"], 1)
+        self.assertEqual(health["last_error"], "OperationalError")
+
+    def test_reads_do_not_queue_behind_write_transactions(self):
+        # The WebUI fires parallel dashboard/log/storage reads while inference
+        # writes run; reads take a WAL snapshot, never the write lock.
+        for i in range(3):
+            self.assertTrue(self.store.record_request(
+                self.record(f"r{i}", started_at=time.time() - i, duration_ms=100 + i))["recorded"])
+        with self.store._lock:  # a write transaction in flight
+            self.assertEqual(self.store.ticket()["epoch"], 0)
+            self.assertEqual(self.store.dashboard(30)["summary"]["requests"], 3)
+            self.assertEqual(self.store.get_request("r0")["id"], "r0")
+            self.assertEqual(len(self.store.list_records("request", 10)["items"]), 3)
+            self.assertFalse(self.store.storage()["degraded"])
+        # Writers and readers share no lock; a fresh record commits immediately.
+        self.assertTrue(self.store.record_request(
+            self.record("w0", started_at=time.time()))["recorded"])
+        self.assertFalse(self.store.storage()["degraded"])
+
+    def test_dashboard_view_storm_does_not_drop_traffic_records(self):
+        # Regression: parallel dashboard queries used to steal the 250ms write
+        # lock budget of live traffic and latch a day of false storage alarms.
+        now = time.time()
+        payload = json.dumps({"id": "seed", "duration_ms": 5})
+        with self.store._lock:
+            self.store._db.execute("PRAGMA synchronous=OFF")  # bulk seed only
+            self.store._db.execute("BEGIN IMMEDIATE")
+            self.store._db.executemany(
+                "INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                [(f"s{i}", now - i, "m", "p", "c", "success", 200, payload, 64, None, 5.0)
+                 for i in range(20000)])
+            self.store._db.execute("COMMIT")
+            self.store._db.execute("PRAGMA synchronous=FULL")
+
+        def traffic(tag):
+            dropped = 0
+            for i in range(20):
+                if not self.store.record_request(
+                        self.record(f"{tag}{i}", started_at=time.time()))["ok"]:
+                    dropped += 1
+            return dropped
+
+        with concurrent.futures.ThreadPoolExecutor(5) as pool:
+            futures = [pool.submit(self.store.dashboard, 30),
+                       pool.submit(self.store.dashboard, 1, "hour"),
+                       pool.submit(self.store.storage), pool.submit(traffic, "a"),
+                       pool.submit(traffic, "b")]
+            dashboards = [futures[0].result(), futures[1].result()]
+            dropped = futures[3].result() + futures[4].result()
+        self.assertIsNone(dashboards[0].get("degraded"))
+        self.assertIsNone(dashboards[1].get("degraded"))
+        self.assertEqual(dropped, 0)
+        health = self.store.storage()
+        self.assertFalse(health["degraded"])
+        self.assertEqual(health["dropped_records"], 0)
+
+    def test_v3_duration_column_backfills_and_p95_uses_covered_index(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "audit.sqlite3"
+            store = AuditStore(path)
+            base = time.time() - 3 * 86400
+            for i in range(5):
+                self.assertTrue(store.record_request(
+                    self.record(f"r{i}", started_at=base + i, duration_ms=100 + i))["recorded"])
+            store.close()
+            with closing(sqlite3.connect(str(path))) as db:
+                db.execute("DROP INDEX requests_duration")
+                db.execute("ALTER TABLE requests DROP COLUMN duration_ms")
+                db.execute("PRAGMA user_version=3")
+                db.commit()
+            migrated = AuditStore(path)
+            try:
+                with closing(sqlite3.connect(str(path))) as db:
+                    self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+                    rows = [r[0] for r in db.execute("SELECT duration_ms FROM requests ORDER BY id").fetchall()]
+                self.assertEqual(rows, [100.0, 101.0, 102.0, 103.0, 104.0])
+                with closing(migrated._open_read()) as plan_conn:
+                    plan = plan_conn.execute(
+                        "EXPLAIN QUERY PLAN SELECT duration_ms FROM requests WHERE started_at>=? AND started_at<=?",
+                        (0, time.time())).fetchall()
+                self.assertIn("COVERING INDEX requests_duration", plan[0][3])
+                summary = migrated.dashboard(30)["summary"]
+                self.assertEqual(summary["requests"], 5)
+                self.assertEqual(summary["p95_duration_ms"], 104)
+            finally:
+                migrated.close()
     def test_v1_ingest_table_migrates_with_backfilled_timestamps(self):
         """Migrate v1 ingest timestamps and indexes while preserving retained deduplication."""
         with tempfile.TemporaryDirectory() as td:
@@ -148,7 +320,7 @@ class AuditStoreTests(unittest.TestCase):
             store = AuditStore(path)
             try:
                 with closing(sqlite3.connect(str(path))) as db:
-                    self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+                    self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
                     columns = [row[1] for row in db.execute("PRAGMA table_info(ingest)").fetchall()]
                     self.assertIn("created_at", columns)
                     self.assertGreater(db.execute(
@@ -230,6 +402,25 @@ class AuditStoreTests(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(self.store.list_records("admin")))
         self.store.clear("details")
         self.assertEqual(self.store.event("admin", "credential_upload", {"event_id": "evt1"})["reason"], "duplicate")
+
+    def test_credit_changes_keep_signed_deltas_and_filter_by_account_and_type(self):
+        self.store.event("credit", "credit.income", {"credential": "a" * 64, "delta": 500.0, "balance": 530,
+                                                     "source": "体验积分", "package_code": "trial",
+                                                     "expires_at": 2e9, "token": "secret-token"})
+        self.store.event("credit", "credit.consume", {"credential": "b" * 64, "delta": -70.5, "balance": 30,
+                                                      "source": "Bearer sk-leak"})
+        income, consume = sorted(self.store.list_records("credit")["items"], key=lambda item: item["action"])[::-1]
+        self.assertEqual(income["details"], {"credential": "a" * 64, "package_code": "trial", "source": "体验积分",
+                                             "delta": 500.0, "balance": 530, "expires_at": 2e9})
+        self.assertEqual(consume["details"]["delta"], -70.5)
+        self.assertNotIn("source", consume["details"])
+        by_account = self.store.list_records("credit", credential="b" * 64)["items"]
+        self.assertEqual([item["action"] for item in by_account], ["credit.consume"])
+        self.assertEqual([item["action"] for item in self.store.list_records("credit", type="income")["items"]],
+                         ["credit.income"])
+        self.assertEqual(self.store.list_records("admin")["items"], [])
+        with self.assertRaises(ValueError):
+            self.store.list_records("credit", type="refund")
 
     def test_event_tickets_cannot_revive_cleared_details(self):
         pending = {"event_id": "pending-event", **self.store.ticket()}
@@ -520,8 +711,9 @@ class AuditStoreTests(unittest.TestCase):
             with closing(sqlite3.connect(self.path)) as fixture:
                 first = samples[-1][0] if samples else 0
                 for index in range(first, population):
-                    fixture.execute("INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?)", (
-                        f"seed{index}", stamp, None, None, None, "success", 200, "{}", 256))
+                    fixture.execute(
+                        "INSERT INTO requests(id,started_at,model,profile,credential,outcome,status_code,payload,logical_bytes) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (f"seed{index}", stamp, None, None, None, "success", 200, "{}", 256))
                     fixture.execute("INSERT INTO attempts VALUES(?,?,?)", (f"seed{index}", 0, "{}"))
                     fixture.execute("INSERT INTO events VALUES(?,?,?,?,?,?)", (
                         f"event{index}", stamp, "runtime", "test", "{}", 128))
@@ -585,6 +777,54 @@ class AuditStoreTests(unittest.TestCase):
         self.store.close()
         self.assertFalse(self.store.record_request(record)["ok"])
         self.assertTrue(self.store.storage()["degraded"])
+
+    def test_client_ip_and_agent_are_sanitized_persisted_and_filterable(self):
+        good = self.record(id="meta-1", client_ip="2001:db8::1", user_agent="synthetic-agent/1.2")
+        self.assertTrue(self.store.record_request(good)["ok"])
+        dirty = self.record(id="meta-2", client_ip="fe80::1%eth0",
+                            user_agent="evil\nBearer sk-secret\r\nX")
+        self.assertTrue(self.store.record_request(dirty)["ok"])
+        items = {item["id"]: item for item in self.store.list_records()["items"]}
+        self.assertEqual(items["meta-1"]["client_ip"], "2001:db8::1")
+        self.assertEqual(items["meta-1"]["user_agent"], "synthetic-agent/1.2")
+        self.assertIsNone(items["meta-2"]["client_ip"])
+        self.assertIsNone(items["meta-2"]["user_agent"])
+        self.assertEqual(self.store.list_records(client_ip="2001:db8::1")["items"][0]["id"], "meta-1")
+        self.assertEqual(self.store.list_records(client_ip="198.51.100.1")["items"], [])
+
+    def test_v2_database_gains_client_ip_without_losing_rows(self):
+        legacy_path = Path(self.temp.name) / "private" / "v2.sqlite3"
+        raw = sqlite3.connect(legacy_path)
+        with raw:
+            raw.execute("CREATE TABLE state (id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL,"
+                        " detail_generation INTEGER NOT NULL, cleared_at REAL NOT NULL)")
+            raw.execute("INSERT INTO state VALUES(1,0,0,0)")
+            raw.execute("CREATE TABLE requests (id TEXT PRIMARY KEY, started_at REAL NOT NULL, model TEXT,"
+                        " profile TEXT, credential TEXT, outcome TEXT, status_code INTEGER,"
+                        " payload TEXT NOT NULL, logical_bytes INTEGER NOT NULL)")
+            raw.execute(
+                "INSERT INTO requests VALUES('legacy-1', ?, 'm', NULL, NULL, 'success', 200, ?, 128)",
+                (time.time(), json.dumps({"id": "legacy-1", "model": "m", "outcome": "success",
+                                          "status_code": 200, "attempts": []})))
+            raw.execute("PRAGMA user_version=2")
+        raw.close()
+        reopened = AuditStore(legacy_path)
+        self.addCleanup(reopened.close)
+        self.assertIn("client_ip",
+                      [c[1] for c in reopened._db.execute("PRAGMA table_info(requests)")])
+        indexes = [row[1] for row in reopened._db.execute("PRAGMA index_list(requests)")]
+        self.assertIn("requests_client", indexes)
+        items = reopened.list_records()["items"]
+        self.assertEqual([item["id"] for item in items], ["legacy-1"])
+        self.assertIsNone(items[0].get("client_ip"))
+        self.assertTrue(reopened.record_request(
+            {"id": "meta-3", **reopened.ticket(), "started_at": time.time(),
+             "public_model": "test-model", "client_ip": "203.0.113.9",
+             "protocol": "chat", "status_code": 200, "outcome": "success"})["ok"])
+        self.assertEqual(reopened.list_records(client_ip="203.0.113.9")["items"][0]["id"], "meta-3")
+        accounting = reopened._db.execute("SELECT request_count FROM detail_accounting").fetchone()[0]
+        raw_count = reopened._db.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+        self.assertEqual(accounting, raw_count)
 
 
 if __name__ == "__main__":

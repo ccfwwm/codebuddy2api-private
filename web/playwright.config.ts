@@ -2,11 +2,14 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: "./e2e",
   timeout: 30000,
-  globalTimeout: 90000,
+  // One worker runs every spec in turn; leave headroom as the suite grows.
+  globalTimeout: 180000,
   workers: 1,
   fullyParallel: false,
   use: {
     baseURL: "http://127.0.0.1:5174",
+    // The UI follows the browser language by default; the specs are written in Chinese.
+    locale: "zh-CN",
     viewport: { width: 1440, height: 1050 },
     browserName: "chromium",
     launchOptions: {

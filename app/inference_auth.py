@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
-from .inbound_limits import _BODY_PATHS
+from .inbound_limits import _BODY_PATHS, anthropic_path
 
 
 def require_api_key(key, authorization=None, x_api_key=None):
@@ -36,7 +36,7 @@ class InferenceAuthMiddleware:
             require_api_key(self.config.get("api_key"), headers.get("authorization"), headers.get("x-api-key"))
         except HTTPException as error:
             payload = error.detail
-            if scope["path"].startswith("/v1/messages"):
+            if anthropic_path(scope["path"]):
                 payload = {"type": "error", "error": {**payload["error"], "type": "authentication_error"}}
             response = JSONResponse(payload, status_code=error.status_code, headers=error.headers)
             return await response(scope, receive, send)

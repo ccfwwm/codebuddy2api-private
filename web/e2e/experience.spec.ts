@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { choose } from "./select";
 
 async function experienceAPI(page: Page) {
   let revision = 1,
@@ -177,7 +178,7 @@ test("glass workspace folds, creates a scoped model and keeps dialogs isolated",
   await page.getByLabel("对外 ID").fill("team-coding");
   await page.getByLabel("上游 ID").fill("fixture-model-0");
   await page.getByRole("radio", { name: /指定区域/ }).check();
-  await page.getByRole("combobox", { name: "区域", exact: true }).selectOption("intl");
+  await choose(page.getByRole("combobox", { name: "区域", exact: true }), "intl");
   await page.getByRole("radio", { name: /指定账号/ }).check();
   await expect(page.getByRole("combobox", { name: "区域", exact: true })).toHaveCount(0);
   await page.getByRole("checkbox", { name: /international.info/ }).check();
@@ -206,20 +207,25 @@ test("glass workspace folds, creates a scoped model and keeps dialogs isolated",
 test("daily range uses hourly points, with desktop and mobile glass layouts", async ({ page }) => {
   await experienceAPI(page);
   await page.goto("/dashboard");
-  await page.getByLabel("统计时间范围").selectOption("1");
-  await expect(page.getByRole("img", { name: "按小时请求量趋势" }).locator("circle")).toHaveCount(
-    24,
-  );
+  await choose(page.getByLabel("统计时间范围"), "1");
+  await expect(
+    page.getByRole("img", { name: "按小时用量趋势" }).locator('[data-series="requests"] circle'),
+  ).toHaveCount(24);
   await page.getByRole("button", { name: "收起侧栏" }).click();
   await expect(page.locator("aside")).toHaveCSS("width", "76px");
   await page.screenshot({ path: "test-results/glass-overview-hourly.png" });
-  await page.getByLabel("统计粒度").selectOption("day");
-  await expect(page.getByRole("img", { name: "按日请求量趋势" }).locator("circle")).toHaveCount(1);
-  await page.getByLabel("统计粒度").selectOption("hour");
+  await choose(page.getByLabel("统计粒度"), "day");
+  await expect(
+    page.getByRole("img", { name: "按日用量趋势" }).locator('[data-series="requests"] circle'),
+  ).toHaveCount(1);
+  await choose(page.getByLabel("统计粒度"), "hour");
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(page.getByRole("img", { name: "按小时请求量趋势" })).toBeVisible();
+  await expect(page.getByRole("img", { name: "按小时用量趋势" })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: "test-results/glass-overview-mobile.png" });
+  // The collapsed mobile sidebar stows the nav strip; only the expand bar remains.
+  await expect(page.getByRole("link", { name: "模型路由", exact: true })).toBeHidden();
+  await page.getByRole("button", { name: "展开侧栏" }).click();
   await page.getByRole("link", { name: "模型路由", exact: true }).click();
   await page.getByRole("button", { name: "新增模型" }).click();
   await page.getByRole("radio", { name: /指定账号/ }).check();

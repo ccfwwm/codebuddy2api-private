@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import io
 import os
+import signal
+import subprocess
+import sys
+import threading
 from pathlib import Path
 import stat
 
@@ -97,26 +101,83 @@ def announce_default_key(config):
     config["announce_default_key"] = False
 
 
+
+
+def _install_lease_release(config):
+    """Release the running-instance lease before uvicorn re-raises the stop signal.
+
+    uvicorn restores the original handlers and re-raises the captured signal, so a
+    `finally` around `Server.run` never executes on SIGTERM. Our handler is that
+    original, so it runs once more and then re-delivers the signal with defaults.
+    """
+    store = config.get("control_store")
+    if store is None or threading.current_thread() is not threading.main_thread():
+        return
+
+    def release(signum, _frame):
+        try:
+            store.release_service_lease()
+        finally:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, release)
+
+
 def run_server(app, config, *, host, port):
-    if not config.get("announce_default_key"):
-        return uvicorn.run(app, host=host, port=port, log_level="warning")
+    _install_lease_release(config)
+    server_class = uvicorn.Server
+    if config.get("announce_default_key"):
+        class FirstStartServer(uvicorn.Server):
+            async def startup(self, sockets=None):
+                await super().startup(sockets=sockets)
+                if self.started and not self.should_exit:
+                    try:
+                        announce_default_key(config)
+                    except BaseException:
+                        # A failed announcement/commit must not leave a hidden-key server running.
+                        self.should_exit = True
+                        await self.shutdown(sockets=sockets)
+                        raise
+        server_class = FirstStartServer
 
-    class FirstStartServer(uvicorn.Server):
-        async def startup(self, sockets=None):
-            await super().startup(sockets=sockets)
-            if self.started and not self.should_exit:
-                try:
-                    announce_default_key(config)
-                except BaseException:
-                    # A failed announcement/commit must not leave a hidden-key server running.
-                    self.should_exit = True
-                    await self.shutdown(sockets=sockets)
-                    raise
-
-    server = FirstStartServer(uvicorn.Config(app, host=host, port=port, log_level="warning"))
+    # Same behavior as uvicorn.run, but keeps the server so a restart can stop it gracefully.
+    server = server_class(uvicorn.Config(app, host=host, port=port, log_level="warning"))
+    config["server"] = server
     try:
         server.run()
     except KeyboardInterrupt:
         pass
+    finally:
+        config.pop("server", None)
     if not server.started:
         raise SystemExit(3)
+
+
+def capture_launch():
+    """Snapshot the command line, environment and directory before .env is loaded."""
+    return {"argv": list(sys.orig_argv), "env": dict(os.environ), "cwd": os.getcwd()}
+
+
+def request_restart(config, grace=30):
+    """Stop serving gracefully; main() then re-executes the original command line."""
+    server = config.get("server")
+    if server is None or not config.get("launch"):
+        raise RuntimeError("当前进程未通过 serve 启动，无法自动重启")
+    config["restart_requested"] = True
+    # In-flight streams get a bounded grace period instead of holding the restart forever.
+    server.config.timeout_graceful_shutdown = grace
+    server.should_exit = True
+
+
+def restart_process(launch):
+    """Replace this process with the exact original invocation, keeping its PID."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.chdir(launch["cwd"])
+    argv = launch["argv"]
+    if os.name == "nt":
+        # Windows exec joins arguments without quoting them.
+        argv = [subprocess.list2cmdline([argument]) for argument in argv]
+    os.execve(sys.executable, argv, launch["env"])

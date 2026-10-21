@@ -8,7 +8,11 @@ Use the [WebUI](webui.md) for everyday management. See [deployment](deployment.m
 
 Precedence: **explicit CLI flags > process environment > `.env` > saved SQLite settings > defaults**. Hot settings apply immediately; restart-marked settings require a manual restart. Change locked options at their source; the WebUI does not edit `.env` or expose API keys.
 
-Compose explicitly passes some environment variables and CLI flags, so deleting a line from `.env` may not unlock it. Recreate the container after changing these values; to let the WebUI manage them, also remove the corresponding explicit Compose settings.
+Compose loads every key in `.env` into the container, so commenting out a line is enough to unlock it; only `CODEBUDDY_AUTH_DIR` and `CODEBUDDY2API_ALLOW_OPEN_NOAUTH` are fixed by the Compose file. Recreate the container after changing these values.
+
+Runtime keys in `.env` stay read-only in the WebUI until they are moved into the configuration store: stop the service and run `python3 converter.py config migrate` (see [configuration migration](deployment.md#configuration-migration)). The Dashboard shows a one-time banner listing those keys; migrating or pressing "Do not remind me" records `config_notice_muted` in the store and stops the reminder, including for later `.env` additions.
+
+`language` (`auto|zh|en`) is the only interface preference the WebUI and the CLI share: it has no environment mapping and is never locked. `--lang` writes it on `serve`, `login` and `config migrate`; `config status` is read-only and only affects that invocation's output.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -30,6 +34,8 @@ Compose explicitly passes some environment variables and CLI flags, so deleting 
 | `--model-capability-guard [true/false]` | `true` | Preflight declared image, tool, reasoning and mapped output limits; changes affect new requests |
 | `--max-images` | `16` | Total images per request; `0` permits no images |
 | `--image-policy` | `truncate` | Keep newest images; `error` rejects excess images with 413 |
+| `--responses-projection-mode balanced\|passthrough` | `balanced` | Rewrite recognized harness blocks that have stable summaries; passthrough disables Responses projection |
+| `--responses-projection-max-bytes` | `40000` | Complete per-item UTF-8 limit for assistant text, tool-argument JSON and tool results; `0` disables, otherwise valid range is `256..33554432` |
 | `--tool-call-max-retry` | `3` | Extra generations after malformed tool calls (each consumes credits); `0` disables retries |
 | `--max-inbound-bytes` | `67108864` | Raw body limit for generation and token-count POSTs, before parsing (chunked included); other routes are not buffered; 413 beyond it |
 | `--max-collect-bytes` | `8388608` | Total retained-output budget for aggregation and realtime validation (content + reasoning + tool arguments/metadata); `response_too_large` beyond it; `0` disables |
@@ -40,27 +46,37 @@ Compose explicitly passes some environment variables and CLI flags, so deleting 
 | `--request-context-mode` | `legacy` | `scoped` enables explicit sessions and per-attempt tracing; changes apply to new requests |
 | `--failover-max` | `0` | Extra credentials tried when a request fails before the first response byte reaches the client; `0` keeps the upstream behaviour of surfacing the failure directly |
 | `--retry-write-timeout` | `false` | Opt a request-body write timeout into replay (fresh connection and `--failover-max`), accepting that bytes already sent may have been processed |
-| `--max-request-bytes` | `33554432` | Positive byte limit for the processed upstream JSON |
+| `--max-request-bytes` | `33554432` | Positive byte limit for processed upstream JSON, excluding gateway-only metadata |
 | `--log-body-limit` | `65536` | Legacy text-preview option; text output is retired and SQLite diagnostics use their own budget |
 
-Environment variables include `CODEBUDDY_AUTH_DIR`, `CODEBUDDY_IMPORT_DIR`, `CODEBUDDY2API_KEY`, `CODEBUDDY2API_ADMIN_CSRF`, `CODEBUDDY2API_ADMIN_ORIGINS`, `CODEBUDDY2API_KEEP_TOOL_METADATA`, `CODEBUDDY2API_STREAM_MODE`, `CODEBUDDY2API_LOG`, `CODEBUDDY2API_MAX_IMAGES`, `CODEBUDDY2API_IMAGE_POLICY`, `CODEBUDDY2API_MAX_REQUEST_BYTES`, `CODEBUDDY2API_LOG_BODY_LIMIT`, `CODEBUDDY2API_FAILOVER_MAX` and `CODEBUDDY2API_RETRY_WRITE_TIMEOUT`. See [deployment](deployment.md) for startup examples.
+Every active environment variable is listed with its default in `.env.example`; startup examples are in [deployment](deployment.md).
+
+### Responses projection
+
+Configure these hot settings through the WebUI, CLI, process environment or `.env`. Precedence is CLI > process environment > `.env` > saved SQLite value > default; CLI/environment values lock the WebUI fields. Compose loads `.env` wholesale, so a commented-out line keeps the WebUI editable.
+
+`responses_projection_mode` defaults to `balanced` and accepts only `balanced` or `passthrough`. Balanced mode rewrites only recognized harness blocks that have stable summaries; text outside those blocks is not budgeted or truncated. It also applies Codex-style head/tail truncation to generated assistant content, complete tool-argument JSON and tool results according to `responses_projection_max_bytes`. Text markers report original bytes, estimated tokens and total lines. Oversized tool arguments remain valid JSON and use a bounded object containing the original head, tail and size metadata. Passthrough disables Responses projection completely.
+
+`responses_projection_max_bytes` defaults to `40000`; valid values are `0` or `256..33554432`. `0` disables per-item truncation only; global inbound/request and output gates still apply. Neither setting changes the client Base URL.
+
+Downgrading to source that predates these keys requires the offline removal of `settings.responses_projection_mode` and `settings.responses_projection_max_bytes` described under [Streaming modes](#streaming-modes).
 
 ### Tool metadata retention
 
-Off by default, preserving the existing policy: desensitization strips tool descriptions, and Responses tool projection also strips them; `--no-compact` does not change this. When enabled, Chat, Responses and Messages retain supported tool descriptions and string `description/title` annotations in parameter schemas. With desensitization enabled, retained text is still processed. Prompt compaction and existing content-filter retry conditions/counts are unchanged; fallback processing also respects this option.
+Responses projection no longer changes tool definitions or schemas. When desensitization is enabled, it strips tool descriptions and string `description/title` annotations by default; enabling this setting retains and processes that text across Chat, Responses and Messages. `--no-compact` does not change this setting.
 
 - **WebUI:** Settings → Keep tool descriptions; unlocked changes apply immediately and persist.
 - **CLI:** append `--keep-tool-metadata` or `--keep-tool-metadata true` to the existing command; explicit `false` overrides the environment.
-- **Environment:** set `CODEBUDDY2API_KEEP_TOOL_METADATA=true`. Compose passes it only when set, leaving the WebUI unlocked otherwise. Remove or comment out the variable to remove the environment lock; do not set an empty string.
+- **Environment:** set `CODEBUDDY2API_KEEP_TOOL_METADATA=true` in `.env`; comment the line out to remove the lock, and do not set an empty string.
 
-Use a source/image build and Compose configuration containing this feature; recreate containers after changing their environment. Retained descriptions may increase input tokens and content-filter rejections; compatibility across accounts/models is not guaranteed. Set `false` to restore the previous policy. This option does not restore other schema fields or deep nodes removed by existing Responses projection, nor relax the request-size budget.
+Use an image or source build containing this feature; recreate the container after changing its environment. Retained descriptions may increase input tokens and content-filter risk; set `false` to restore the desensitization default. This setting does not change Responses balanced/passthrough mode or relax request-size limits.
 
 ### Streaming modes
 
 `stream_mode` defaults to `compatible`. Configure it through `--stream-mode compatible|realtime`, `CODEBUDDY2API_STREAM_MODE`, or the WebUI enum; explicit CLI/environment sources lock that field. Every generation request, including non-streaming, records the selected mode and freezes it with `max_collect_bytes` before routing. Hot changes affect only later requests, not in-flight failovers. Non-streaming responses remain aggregated JSON; there is no client mode override.
 
 - `compatible` preserves existing behavior: Responses streams aggregate first; Chat and Messages aggregate when tools are present and otherwise pass through upstream increments. Aggregated output is validated and replayed in fragments. Non-stream requests always use the validated aggregate path in either mode.
-- `realtime` forwards reasoning, text, refusal and tool-argument increments for all three protocols. Responses assigns stable indexes when items start; Anthropic uses stable block indexes. Adapters buffer tools with missing identity until the argument phase or terminal marker, append metadata fragments without guessing from prefixes, and reject identity changes after an item starts. `max_collect_bytes` bounds retained UTF-8 output; `0` disables that limit.
+- `realtime` forwards text, refusal, tool-argument and reasoning increments for all three protocols as they arrive, so reasoning timing stays visible to clients; Responses and Anthropic still deliver one logical thinking item/block with stable indexes. `compatible` keeps the older behaviour of coalescing reasoning into one delta before the first visible output, which hides the reasoning timeline and can inflate client-side TPS/TTFT. Adapters buffer tools with missing identity until the argument phase or terminal marker, append metadata fragments without guessing from prefixes, and reject identity changes after an item starts. `max_collect_bytes` bounds retained UTF-8 output; `0` disables that limit.
 
 Realtime Messages keeps one content block open at a time. The active tool remains incremental; later tool, text or thinking blocks may wait until upstream completion. Deferred event bytes share `max_collect_bytes`. A tool still awaiting its identity does not block unrelated text before its block starts.
 
@@ -68,12 +84,16 @@ Realtime mode never regenerates malformed or incomplete tool arguments. Tool IDs
 
 Explicit filter-only terminals are valid even without output: realtime Responses emits `response.incomplete` with `content_filter`, retaining available usage. This does not permit an ordinary empty response, missing terminal or error frame to succeed.
 
-For runtime fallback, select `compatible` to restore aggregate streaming and tool-argument repair without changing saved state. Before running older source, remove the new CLI/environment option, stop the gateway and back up the **current** data directory, including its SQLite/WAL/SHM generation. Do not restore a stale pre-upgrade database: that could roll back newer claims, sessions, revocations and account state. The following offline procedure writes only the removal of `settings.stream_mode` and a revision increment, then checks integrity; all other settings and tables remain intact. Never run it against a live database or mix SQLite generations.
+For runtime fallback, select `compatible` to restore aggregate streaming and tool-argument repair without changing saved state. Before running older source, remove the new CLI/environment option, stop the gateway and back up the **current** data directory, including its SQLite/WAL/SHM generation. Do not restore a stale pre-upgrade database: that could roll back newer claims, sessions, revocations and account state. The following offline procedure deletes only the listed `settings.<name>` keys and increments the revision, then checks integrity; all other settings and tables remain intact. Pass one key or several. Never run it against a live database or mix SQLite generations.
 
 ```sh
-python3 - /path/to/control.sqlite3 <<'PY'
+python3 - /path/to/control.sqlite3 settings.stream_mode <<'PY'
 import json, sqlite3, sys
-con = sqlite3.connect(sys.argv[1])
+path, names = sys.argv[1], sys.argv[2:]
+keys = [name.split(".", 1)[1] for name in names if name.count(".") == 1 and name.split(".", 1)[1]]
+if len(keys) != len(names):
+    raise SystemExit("pass one or more settings.<name> keys")
+con = sqlite3.connect(path)
 try:
     con.execute("BEGIN IMMEDIATE")
     row = con.execute("SELECT revision,payload FROM control WHERE id=1").fetchone()
@@ -83,9 +103,11 @@ try:
     data = json.loads(payload)
     if set(data) != {"settings", "models", "credentials"} or not isinstance(data["settings"], dict):
         raise SystemExit("unexpected control payload")
-    if "stream_mode" not in data["settings"]:
-        raise SystemExit("stream_mode is absent; no write needed")
-    del data["settings"]["stream_mode"]
+    present = [key for key in keys if key in data["settings"]]
+    if not present:
+        raise SystemExit("no requested key is present; no write needed")
+    for key in present:
+        del data["settings"][key]
     con.execute("UPDATE control SET revision=?,payload=? WHERE id=1",
                 (revision + 1, json.dumps(data, ensure_ascii=False, allow_nan=False)))
     con.commit()
@@ -101,7 +123,7 @@ Older strict setting validators reject the unknown saved key, so changing only i
 
 ### Connection reuse and account capacity
 
-Both settings are available in the WebUI; their environment variables are `CODEBUDDY2API_UPSTREAM_KEEPALIVE` and `CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT`. Unset variables leave Compose settings unlocked. Connection reuse defaults to off; when enabled, each official origin permits 64 connections with 16 idle connections and a 30-second keepalive expiry. Authentication is request-scoped, upstream cookies are not stored, and shutdown closes the pools. Proxy environment, timeouts and replay rules are unchanged; disable and restart to restore fresh connections.
+Both settings are available in the WebUI; their environment variables are `CODEBUDDY2API_UPSTREAM_KEEPALIVE` and `CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT`. Commenting a line out of `.env` keeps the WebUI in control. Connection reuse defaults to off; when enabled, each official origin permits 64 connections with 16 idle connections and a 30-second keepalive expiry. Authentication is request-scoped, upstream cookies are not stored, and shutdown closes the pools. Proxy environment, timeouts and replay rules are unchanged; disable and restart to restore fresh connections.
 
 The account limit defaults to `0`. Positive limits skip full accounts within existing routing and free-first rules; a full free tier never spills into paid accounts. No capacity returns `503 / credential_concurrency_limit` with `Retry-After: 3`, without queueing or penalizing the account. Completion, cancellation and failed-account rotation release capacity. The credentials API exposes `in_flight` and `max_in_flight`. Only the three client generation endpoints count; limits are per process, not shared between instances. Setting `0` restores unlimited account capacity without interrupting active requests.
 
@@ -117,7 +139,8 @@ Switch back to `legacy` to restore old behavior for new requests; in-flight requ
 
 ## Automation and rewards
 
-Automatic check-in and Buddy travel are per-account switches (WebUI credentials page): on by default domestically, off internationally, applied live without restart.
+Automatic check-in and Buddy travel are per-account switches (WebUI credentials page): on by default for domestic personal accounts, off internationally, applied live without restart. The growth center is personal-only, so enterprise accounts never travel and no longer surface the upstream 403.
+The growth-center sweep (`auto_growth`, on by default for domestic personal accounts) rides the hourly maintenance pass as pure accept/claim: it claims finished tasks for credit and energy and never starts a behavior chain by itself. Per-task `growth_auto` switches (off by default) opt specific tasks into automation, so the sweep also drives the matching chain — real conversations, app opens or expert summons that may spend credits. The credential drawer lists live tasks with one-click manual runs for a single task or all enabled ones, and task switches can be copied to selected accounts (`POST /admin/credentials/growth-batch`); `GET /admin/credentials/{id}/growth-tasks`, `.../growth-tasks/auto` and `.../auto-all` back the panel. Manual runs are server-side jobs, one per account: the request returns the job at once, closing the drawer or the page does not stop it, starting again while it runs returns the running job, and `GET /admin/growth-jobs` lists every account's current or last job with the task in progress for the page banner. Manual runs and sweep claims are audited; enterprise or international accounts never see the panel.
 
 `CODEBUDDY2API_AUTO_ACCEPT_BUDDY` is startup-only and defaults to `false`. It preauthorizes enabled domestic accounts for first-Buddy onboarding, agreement and travel; automatic travel still respects its account switch. `first_buddy` needs no acceptance API: pending states, including `not_accepted`, allow one real domestic WorkBuddy conversation on that account. Prefer an eligible zero-rate model, otherwise the lowest known rate; request at most 32 output tokens with possible credit usage. Other reward tasks, paid boxes, pet switching and international trials are excluded.
 
@@ -151,7 +174,8 @@ Trial credits are manual-only for eligible `intl-work` accounts through the cred
 | `GET /admin/credentials` | Credential inventory and runtime state |
 | `POST /admin/credentials` | Import an `.info` file from the server's controlled directory |
 | `DELETE /admin/credentials/{name}` | Delete the credential file by filename; returns 409 while referenced by model bindings |
-| `PATCH /admin/credentials/{id}` | One Boolean field per account: `enabled`, `auto_checkin`, or `auto_travel`; automation preference saves do not claim immediately |
+| `PATCH /admin/credentials/{id}` | One Boolean field per account (`enabled`, `auto_checkin`, `auto_travel`, `auto_daily_chat` or `auto_growth`) or a `growth_auto` task-code mapping; automation preference saves do not claim immediately |
+| `GET /admin/credentials/{id}/growth-tasks` · `POST .../growth-tasks/auto` · `.../auto-all` · `GET /admin/growth-jobs` · `POST /admin/credentials/growth-batch` | Live growth task list; start a background job for one task or every enabled one; current and last job per account; batch task switches for selected accounts |
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | Start/poll login; `site=cn` (default), `intl` (international WorkBuddy) or `intl-codebuddy` (international CodeBuddy) |
 | `GET /admin/credits` · `POST /admin/checkin` | Inspect credits; daily-idempotent check-in followed by domestic travel when enabled |
 | `POST /admin/sync` | Synchronize all enabled accounts' balances, catalogs and usage; no check-in or trial claims |
@@ -175,7 +199,7 @@ Normal same-origin access does not require disabling protection. Behind a revers
 CODEBUDDY2API_ADMIN_CSRF=false
 ```
 
-This is startup-only, CLI takes precedence over the environment, and the WebUI cannot change it. Use a source/image build containing this option and the updated Compose configuration. Recreate the container after changing its environment; `docker compose restart` alone is insufficient. Adding the variable does not add this feature to an older image.
+This is startup-only, CLI takes precedence over the environment, and the WebUI cannot change it. Write the value in `.env` or pass the flag, then recreate the container; `docker compose restart` alone is insufficient.
 
 Disabling skips login Origin checks and Origin/CSRF checks on Cookie-authenticated management writes and OAuth polling. API keys, session expiry, OAuth task ownership, official authorization-site validation and dangerous-action confirmations remain enforced; `/v1/*` is unaffected.
 
@@ -217,6 +241,13 @@ Credential domain / token issuer determine the product identity. Chat and refres
 - WebUI region, product and credential bindings strictly limit candidates; unavailable bindings never fall back to unselected accounts. Disabled models also reject direct requests. Renaming hides the original ID unless you choose to retain it.
 - Sent requests are not replayed against another account because of account availability or HTTP errors; later requests select again. Pending catalog/credential readiness usually returns 503 with `Retry-After`; unsupported or disabled models return 404.
 
+Routing and catalog maintenance are switchable without reverting data:
+
+- `routing_scheduler`: `shadow` (default) runs the legacy scan and the indexed shards side by side, returns the legacy answer and records bounded, credential-free mismatches under `GET /admin/performance`; switch to `indexed` once the mismatch counter stays at zero; `indexed` reuses one eligibility shard per model, request-scoped alias and revision set; `legacy` re-evaluates every credential on every request. Shards are invalidated only when entry identities, the policy, the published catalogs or an account's solvency actually change, so token refreshes and maintenance writes keep the steady state.
+- `catalog_probe_mode`: `account` (default) refreshes every synced account each cycle; `representative` probes one credential per product profile per TTL cycle — accounts without a catalog first, then the current source, then the stalest — with exponential backoff after failures, and back-fills missing or dirty account catalogs under a bounded per-cycle quota so new accounts become routable without a manual scan. An unprobed or failed account keeps its last trusted catalog, `/v1/models` stays the union of current account catalogs, and only models newly advertised by the representative mark older accounts dirty.
+- `POST /admin/models/scan` refreshes every current account once, in the background; `GET /admin/models/scan` reports progress, successes, failures, catalog differences, the overall error and a per-profile breakdown of distinct catalog versions. It is the only way to calibrate all accounts at once and is never a periodic task.
+- `housekeep_concurrency` (default `4`) bounds maintenance workers; balances, catalogs and usage each get an independent slot pool, `1` restores the previous serial cycle, and failed account syncs retry with exponential backoff plus jitter. Accounts synced within five minutes are skipped by the next full cycle, so an event-driven cycle never repeats them.
+
 ### Model declarations and image compatibility
 
 `/v1/models` retains its existing fields and adds `capabilities`, `limits` and `metadata_by_profile`; management and routing previews expose the same metadata. Capabilities use `supported`, `unsupported`, `mixed` or `unknown`. Limits carry `state` (`known`, `mixed`, `unknown`) and `value`; only unanimous known limits have a numeric value. Per-profile arrays preserve distinct account declarations without identities. Safe descriptions, capabilities, windows, reasoning options, related models and parameter suggestions are allowlisted; credentials, internal configuration and authenticated URLs are excluded. These are upstream declarations, not native-model or measured guarantees; suggestions do not override requests.
@@ -225,9 +256,40 @@ Credential domain / token issuer determine the product identity. Chat and refres
 
 Both international profiles merge image-bearing consecutive `user` runs only after routing, preserving content order and image data. Domestic bodies, text-only runs and system/assistant/tool boundaries remain unchanged. Conflicting message attributes or unrepresentable content return `400 / image_user_run_not_mergeable`; final byte limits still apply. This compatibility step remains enabled when capability preflight is disabled; it neither adds retries nor makes a text model natively visual.
 
+### Measured rates and output limits
+
+Catalog multipliers are upstream declarations, and a model can keep declaring `x0.00` after upstream starts charging for it. Every response's `usage` carries the credit actually charged, and the audit log keeps it per request, so the gateway measures billing instead of trusting the declaration:
+
+- A model that a product declares free counts as **measured billing** when any of its latest 20 requests in the past 7 days on that product was charged. It then stops being free everywhere: zero-balance accounts lose it, free-first ordering no longer prefers it and `auto` stops counting it as free. Twenty uncharged requests in a row make it free again.
+- Traffic proves that a model is billed but not its rate: upstream caches prompts per conversation and bills a hit at about a twentieth of fresh input, often without reporting it in `usage`, so per-request charges understate the per-token price by an order of magnitude. A measured-billing model therefore shows **实测计费 · 倍率待估** with its average charge per request until a probe calibrates it; it never reads as free.
+- A probe sends the same ≈8K-token request, each in a fresh conversation, to the target and to a model on the same product with a declared paid rate (the one nearest 0.1x). The target's rate is that declared rate scaled by the two per-token charges, so no token price is assumed. A target that is not charged needs no reference request.
+- `GET /v1/models` reports the effective rate in `credits` / `credits_by_profile` and adds `credits_estimated: true` when the lowest rate is such an estimate.
+- A manual rate per model and product (`credits_override` on the model rule, `0`–`1000`; `0` confirms free) overrides both the declaration and the measurement for routing and `/v1/models`. Custom aliases carry no rate of their own; set it on the upstream model's rule.
+- `POST /admin/models/{id}/rate-probe` sends one ≈8K-token request for that model on every product that serves it, using an account with balance, and stores the charge upstream reported with the calibrated rate. `POST /admin/models/rate-probe` does the same for every model a product declares free. Both start the one shared background job (four probes at a time) and return it at once; starting while it runs returns the running job, and `GET /admin/models/rate-probe` reports progress with the model, product and step in flight, plus every result. A truly free model costs nothing to probe; a charged one costs its own request (≈0.6 credits for a ≈1x model) plus a few billing units for the reference. Every probe request, the reference included, is also written to the request log with its tokens and charge: protocol `rate_probe`, conversation ID prefixed `rate-probe-`. The calibrated samples are kept for 30 days in the control database and are not counted twice from the log.
+
+Declared `maxOutputTokens` values are frequently higher than what a model emits, and a larger `max_tokens` is clamped silently rather than rejected. `scripts/probe_max_tokens.py` measures the real limit through the gateway: it asks each model to count far enough to fill a tier and tells upstream truncation (`finish=length` below the request) apart from a model that chose to stop. Tiers never exceed the declared limit, models run four at a time, each within a 600-second budget, and results append to a JSONL log that `--resume` continues.
+
+```bash
+python3 scripts/probe_max_tokens.py --key "$CODEBUDDY2API_KEY" --panel-out auth/output_probes.json
+python3 scripts/probe_max_tokens.py --key "$CODEBUDDY2API_KEY" --models glm-5.2 --resume --panel-out auth/output_probes.json
+python3 scripts/probe_max_tokens.py --key "$CODEBUDDY2API_KEY" --dry-run
+```
+
+`--panel-out` merges results into `output_probes.json` beside `control.sqlite3`; models not re-measured keep their previous record. `GET /admin/models/output-probes` serves the file read-only and picks up a rerun on the next request without a restart. Probing spends real credits.
+
+## Reasoning compatibility
+
+Messages `enabled` / `adaptive` activate Chat reasoning; `output_config.effort` and Responses `reasoning.effort` map to `reasoning_effort`. An explicit top-level `reasoning_effort` takes precedence, except Messages `disabled` always selects `none`; model capability checks still apply. Omitted controls leave upstream defaults unchanged.
+
+Without an explicit effort, Messages activation uses the selected account's `reasoning.defaultEffort` or legacy `reasoning.effort`, restricted to its declared options. Otherwise it prefers `high`, then an available option; unknown declarations fall back to `high`. Failover resolves the replacement account's default again.
+
+Manual `enabled` requires an integer `budget_tokens >= 1024`, but the budget is not an exact upstream token limit; `max_tokens` is forwarded unchanged. This mapping does not reproduce native adaptive scheduling. Only `display: summarized` is supported.
+
+Readable history is kept in `reasoning_content`, never ordinary answer text. Responses uses readable `content` before `summary`; summaries cannot reconstruct native hidden reasoning. Signatures are not forwarded. `redacted_thinking`, encrypted-only thinking and non-empty Responses `encrypted_content` return 400 before routing; upstreams decide which readable history they use.
+
 ## Request boundaries
 
-- All three generation protocols normalize `developer` to `system`, move an existing system message first or insert a default. This normalization does not mutate the caller's payload. Responses projection and optional desensitization process content separately; the whole pipeline is not a verbatim pass-through.
+- All three generation protocols normalize `developer` to `system`, move an existing system message first or insert a default. This normalization does not mutate the caller's payload. Optional [Responses projection](#responses-projection) and desensitization process content separately; the whole pipeline is not a verbatim pass-through by default.
 - Images count across all history and tool results, including duplicates, in message/content array order. The default keeps the newest 16, removing only excess images while retaining text and message structure; emptied image content receives a text placeholder.
 - `--image-policy error` returns local `413 / too_many_images`. JSON still over budget after processing returns `413 / request_too_large`, without further text truncation to fit the limit.
 - Image count does not guarantee acceptable individual image sizes or model vision support. URL/base64 images can be converted; Responses image `file_id` is unsupported.
@@ -274,4 +336,4 @@ Both international profiles merge image-bearing consecutive `user` runs only aft
 
 ## Downgrades and rollback
 
-Feature switches hold no hidden state: disabling a guard or mode stops it for new requests, and reverting source restores previous behavior. The exceptions are persisted settings and automation state: `control.sqlite3` stores WebUI settings, model rules and reward reservations, and older code rejects unknown fields. Before downgrading source, remove newly added startup options, stop the service, back up the **current** data directory, and use the narrowly scoped offline `settings.stream_mode` removal procedure above with a revision increment and integrity check. Do not restore a pre-upgrade database or mix WAL/SHM generations: doing so could roll back newer claims, sessions, revocations and account state. Rollback never undoes completed upstream check-ins, claims or travel dispatches.
+Feature switches hold no hidden state: disabling a guard or mode stops it for new requests, and reverting source restores previous behavior. The exceptions are persisted settings and automation state: `control.sqlite3` stores WebUI settings, model rules and reward reservations, and older code rejects unknown fields. Before downgrading source, remove newly added startup options, stop the service, back up the **current** data directory, and use the narrowly scoped offline `settings.<name>` removal procedure above with a revision increment and integrity check. Do not restore a pre-upgrade database or mix WAL/SHM generations: doing so could roll back newer claims, sessions, revocations and account state. Rollback never undoes completed upstream check-ins, claims or travel dispatches.

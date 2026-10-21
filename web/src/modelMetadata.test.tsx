@@ -1,9 +1,19 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { api, type ModelRule } from "./api";
-import { CapabilityBadges, ModelMetadata } from "./modelMetadata";
+import {
+  CapabilityBadges,
+  EffortChips,
+  ModelMetadata,
+  effortSummary,
+  formatRate,
+  formatTokens,
+  modelSearchText,
+  rateOf,
+  specRange,
+} from "./modelMetadata";
 import { Models } from "./pages/Models";
-import { Settings } from "./pages/Settings";
+import { choose } from "./test-utils";
 
 const model: ModelRule = {
   id: "upstream",
@@ -35,7 +45,11 @@ const model: ModelRule = {
         maxInputTokens: 192000,
         maxOutputTokens: 64000,
         iconUrl: "https://example.invalid/model.svg",
-        reasoning: { supportedEfforts: ["low", "high"], canDisableThinking: false },
+        reasoning: {
+          supportedEfforts: ["low", "high"],
+          defaultEffort: "high",
+          canDisableThinking: false,
+        },
         contextWindow: { defaultLength: 192000, supportedLengths: [64000, 192000] },
       },
     ],
@@ -69,9 +83,7 @@ describe("model declarations", () => {
     expect(screen.getByText("可选强度")).toBeTruthy();
     expect(screen.getByText("可选窗口")).toBeTruthy();
     expect(container.querySelector("img")).toBeNull();
-    fireEvent.change(screen.getByRole("combobox", { name: "查看产品声明" }), {
-      target: { value: "intl-work" },
-    });
+    choose(screen.getByRole("combobox", { name: "查看产品声明" }), "intl-work");
     expect(screen.getByText("English description")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "声明 2" })).toBeTruthy();
     expect(screen.queryByText("中文说明", { selector: "span" })).toBeNull();
@@ -143,6 +155,9 @@ describe("model declarations", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "搜索模型" }), {
       target: { value: "Display" },
     });
+    expect(screen.getByText("192K")).toBeTruthy();
+    expect(screen.getByText("32K–64K")).toBeTruthy();
+    expect(screen.getByText("图片因路由而异")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "模型详情" }));
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByRole("combobox", { name: "查看产品声明" })).toBeTruthy();
@@ -150,33 +165,89 @@ describe("model declarations", () => {
   });
 });
 
-describe("capability guard settings", () => {
-  function settings(locked: boolean) {
+describe("model table summaries", () => {
+  it("formats token windows, rates and effort options from declarations", () => {
+    expect(formatTokens(1_000_000)).toBe("1M");
+    expect(formatTokens(192_000)).toBe("192K");
+    expect(specRange(model, "maxInputTokens")).toEqual([192000]);
+    expect(specRange(model, "maxOutputTokens")).toEqual([32000, 64000]);
+    expect(effortSummary(model)).toEqual({
+      options: ["low", "high"],
+      defaults: ["high"],
+      closable: false,
+      only: false,
+    });
+    expect(rateOf(0)).toBe(0);
+    expect(formatRate(0.114)).toBe("0.11x");
+    expect(rateOf("x0.5 credits")).toBeNull();
+    expect(rateOf(-1)).toBeNull();
+  });
+
+  it("falls back to contextWindow lengths when input tokens are missing", () => {
+    const windowOnly = {
+      metadata_by_profile: {
+        "cn-cli": [
+          {
+            id: "m",
+            contextWindow: { defaultLength: 300000, supportedLengths: [300000, 1000000] },
+          },
+        ],
+      },
+    };
+    expect(specRange(windowOnly, "maxInputTokens")).toEqual([300000]);
+    expect(specRange(windowOnly, "maxOutputTokens")).toEqual([]);
+  });
+});
+
+describe("effort and search summaries", () => {
+  it("marks the default effort and describes fixed or absent thinking", () => {
+    render(<EffortChips model={model} />);
+    expect(screen.getByTitle("默认档")).toBeTruthy();
+    render(
+      <EffortChips
+        model={{
+          capabilities: { reasoning: "supported" },
+          metadata_by_profile: {
+            "cn-cli": [{ id: "m", reasoning: { defaultEffort: "medium" } }],
+          },
+        }}
+      />,
+    );
+    expect(screen.getByText("固定档 · 默认 medium")).toBeTruthy();
+    render(<EffortChips model={{ capabilities: { reasoning: "unsupported" } }} />);
+    expect(screen.getByText("不支持思考")).toBeTruthy();
+  });
+
+  it("searches across identifiers, names, descriptions and vendors", () => {
+    const text = modelSearchText(model);
+    expect(text).toContain("display model");
+    expect(text).toContain("中文说明");
+    expect(modelSearchText({ ...model, public_id: "" })).toContain("upstream");
+  });
+});
+
+describe("capability guard settings on model routing", () => {
+  function modelsPayload(locked: boolean) {
     return {
       revision: 1,
-      audit: {},
-      items: [
-        {
-          key: "model_capability_guard",
-          value: true,
-          stored: null,
-          source: locked ? "environment" : "default",
-          mode: "hot",
-          type: "boolean",
-          label: "模型能力预检",
-          locked,
-        },
-      ],
+      models: [model],
+      model_guard: true,
+      model_guard_locked: locked,
+      model_capability_guard: true,
+      model_capability_guard_locked: locked,
     };
   }
 
   it("saves an explicit false without changing other settings", async () => {
-    vi.spyOn(api, "get").mockResolvedValue({ data: settings(false) });
+    vi.spyOn(api, "get").mockImplementation((url) =>
+      Promise.resolve({
+        data: url === "/models" ? modelsPayload(false) : { credentials: [] },
+      }),
+    );
     const save = vi.spyOn(api, "patch").mockResolvedValue({ data: { revision: 2 } });
-    render(<Settings />);
-    const toggle = await screen.findByRole("checkbox", { name: /模型能力预检/ });
+    render(<Models />);
+    const toggle = await screen.findByRole("switch", { name: /模型能力预检/ });
     fireEvent.click(toggle);
-    fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
     await waitFor(() =>
       expect(save).toHaveBeenCalledWith("/settings", {
         revision: 1,
@@ -186,11 +257,16 @@ describe("capability guard settings", () => {
     expect(screen.getByText(/国际图片归并及其他安全限制不变/)).toBeTruthy();
   });
 
-  it("shows an environment-locked guard instead of an editable switch", async () => {
-    vi.spyOn(api, "get").mockResolvedValue({ data: settings(true) });
-    render(<Settings />);
-    await screen.findByText("外部锁定");
-    expect(screen.queryByRole("checkbox", { name: /模型能力预检/ })).toBeNull();
-    expect(screen.getByText("当前生效：开启")).toBeTruthy();
+  it("disables the switches when locked by external configuration", async () => {
+    vi.spyOn(api, "get").mockImplementation((url) =>
+      Promise.resolve({
+        data: url === "/models" ? modelsPayload(true) : { credentials: [] },
+      }),
+    );
+    render(<Models />);
+    const capSwitch = await screen.findByRole("switch", { name: /模型能力预检/ });
+    const guardSwitch = await screen.findByRole("switch", { name: /表外模型拦截/ });
+    expect(capSwitch).toHaveProperty("disabled", true);
+    expect(guardSwitch).toHaveProperty("disabled", true);
   });
 });

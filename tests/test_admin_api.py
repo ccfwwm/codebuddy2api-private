@@ -39,6 +39,12 @@ class AdminApiTests(unittest.TestCase):
             admin_set_credential_enabled=Mock(side_effect=lambda identity, enabled: self.store.set_credential(identity, enabled)),
             admin_apply_settings=Mock(), admin_delete_guard=Mock(),
             managed_auth_dir=Mock(return_value=self.root), _store_credential=Mock(),
+            catalog_status=Mock(return_value={"probe_mode": "account", "representative": None,
+                                              "scan": {"status": "idle", "total": 0, "completed": 0,
+                                                       "success": 0, "failed": 0, "differences": 0,
+                                                       "started_at": None, "finished_at": None, "accounts": []}}),
+            start_catalog_scan=Mock(return_value={"status": "running"}),
+            catalog_scan_view=Mock(return_value={"status": "idle"}),
             _credential_identity=Mock(return_value="fingerprint"),
             _save_oauth_credential=Mock(return_value=self.root / "first.info"), _OAUTH=Mock())
         self.gateway._OAUTH.start.return_value = {"login_id": "task", "verification_uri": "https://www.codebuddy.cn/login", "expires_in": 600}
@@ -480,6 +486,19 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(response.json()["models"][0]["public_id"], "synced-model")
 
 
+    def test_catalog_scan_routes_require_session_and_delegate(self):
+        self.assertEqual(self.client.post("/admin/models/scan").status_code, 401)
+        self.assertEqual(self.client.get("/admin/models/scan").status_code, 401)
+        csrf = self.login()
+        started = self.client.post("/admin/models/scan", headers=csrf)
+        self.assertEqual(started.status_code, 200, started.text)
+        self.assertEqual(started.json(), {"status": "running"})
+        self.gateway.start_catalog_scan.assert_called_once()
+        state = self.client.get("/admin/models/scan")
+        self.assertEqual(state.status_code, 200, state.text)
+        self.assertEqual(state.json(), {"status": "idle"})
+        self.gateway.catalog_scan_view.assert_called()
+
     def test_dashboard_granularity_is_validated_and_forwarded(self):
         response = self.client.get("/admin/dashboard?days=1&granularity=hour", headers=self.headers)
         self.assertEqual(response.status_code, 200, response.text)
@@ -511,6 +530,13 @@ class AdminApiTests(unittest.TestCase):
         self.gateway.admin_set_credential_enabled.assert_called_once_with("fingerprint", False)
         self.gateway.admin_delete_guard.side_effect = ValueError("referenced")
         self.assertEqual(self.client.delete("/admin/credentials/first.info", headers=self.headers).status_code, 409)
+        # The confirmed unbind flow bypasses the middleware guard; the delete route owns it.
+        self.gateway.admin_delete_guard.reset_mock()
+        self.gateway.admin_delete_guard.side_effect = None
+        self.assertEqual(
+            self.client.delete("/admin/credentials/first.info?unbind=1", headers=self.headers).status_code,
+            200)
+        self.gateway.admin_delete_guard.assert_not_called()
 
     def test_upload_limits_paths_and_secret_errors(self):
         for files in ([{"name": "../first.info", "content": "{}"}], [{"name": "db.sqlite3", "content": "{}"}],
@@ -552,6 +578,79 @@ class AdminApiTests(unittest.TestCase):
         self.assertNotIn("access_token", saved["auth"])
         self.assertNotIn("refresh_token", saved["auth"])
         self.assertNotIn("token", saved["auth"])
+
+    def refresh_token(self, uid):
+        import base64
+        claims = base64.urlsafe_b64encode(json.dumps({"sub": uid}).encode()).decode().rstrip("=")
+        return f"header.{claims}.signature"
+
+    def test_refresh_import_rejects_bad_endpoint_and_batches(self):
+        post = lambda body: self.client.post("/admin/credentials/refresh-import", headers=self.headers, json=body)
+        self.assertEqual(post({"profile": "unknown", "refresh_tokens": ["a"]}).status_code, 400)
+        for tokens in ([], [""], [1], ["x" * 8193], ["a"] * 51):
+            with self.subTest(count=len(tokens)):
+                self.assertEqual(post({"profile": "cn-work", "refresh_tokens": tokens}).status_code, 400)
+        self.gateway._store_credential.assert_not_called()
+
+    def test_refresh_import_isolates_failures_and_dedupes_tokens(self):
+        from app import admin_api
+        from unittest.mock import patch
+        calls = []
+
+        def fake(token, profile, *, uid=""):
+            calls.append((token, profile, uid))
+            if uid == "uid-2":
+                raise RuntimeError("刷新令牌已失效或端点不匹配")
+            return {"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh",
+                    "expiresIn": 3600, "domain": "www.workbuddy.cn"}
+
+        tokens = [self.refresh_token("uid-1"), self.refresh_token("uid-2"), "not-a-jwt",
+                  self.refresh_token("uid-1")]
+        def fake_account(token, domain):
+            return {"uid": "uid-1", "type": "ultimate", "enterpriseId": "tenant-7", "nickname": "企业账号"}
+
+        tokens = [self.refresh_token("uid-1"), self.refresh_token("uid-2"), "not-a-jwt",
+                  self.refresh_token("uid-1")]
+        self.gateway._store_credential.side_effect = lambda directory, name, content, uid, **kw: Path(directory) / name
+        with patch.object(admin_api.auth_oauth, "refresh_tokens", side_effect=fake), \
+                patch.object(admin_api.auth_oauth, "fetch_account", side_effect=fake_account):
+            response = self.client.post("/admin/credentials/refresh-import", headers=self.headers,
+                                        json={"profile": "cn-work", "refresh_tokens": tokens})
+        self.assertEqual(response.status_code, 200, response.text)
+        rows = response.json()["results"]
+        self.assertEqual([row["ok"] for row in rows], [True, False, False])
+        self.assertEqual(rows[0]["name"], "uid-1.info")
+        self.assertIn("失效", rows[1]["error"])
+        self.assertIn("sub", rows[2]["error"])
+        self.assertEqual([call[2] for call in calls], ["uid-1", "uid-2"])
+        self.gateway._store_credential.assert_called_once()
+        saved = json.loads(self.gateway._store_credential.call_args.args[2].decode("utf-8"))
+        self.assertEqual(saved["auth"]["accessToken"], "synthetic-access")
+        self.assertEqual(saved["auth"]["domain"], "www.workbuddy.cn")
+        self.assertEqual(saved["account"]["uid"], "uid-1")
+        # The account block supplies the tenant, so enterprise credentials must not fall back to a bare uid.
+        self.assertEqual(saved["account"]["enterpriseId"], "tenant-7")
+        self.assertEqual(saved["account"]["type"], "ultimate")
+        self.assertNotIn("synthetic-access", response.text)
+
+    def test_config_notice_lists_runtime_env_and_dismissal_persists(self):
+        from unittest.mock import patch
+        self.store.update_settings({"config_notice_muted": False}, self.store.snapshot()["revision"])
+        # Each dashboard build must start from a fresh payload, not the mocked shared dict.
+        self.audit.dashboard.side_effect = lambda *args, **kwargs: {
+            "summary": {}, "series": [], "models": [], "profiles": []}
+        with patch.dict("os.environ", {"CODEBUDDY2API_MAX_IMAGES": "8", "CODEBUDDY2API_BIND": "0.0.0.0"}):
+            dashboard = self.client.get("/admin/dashboard", headers=self.headers)
+            notice = dashboard.json()["config_notice"]
+            self.assertEqual(notice["count"], 1)
+            self.assertEqual(notice["items"][0]["key"], "max_images")
+            self.assertIn("config migrate", notice["command"])
+            dismissed = self.client.post("/admin/config-notice/dismiss", headers=self.headers, json={})
+            self.assertEqual(dismissed.status_code, 200, dismissed.text)
+            self.assertTrue(self.store.snapshot()["settings"]["config_notice_muted"])
+            again = self.client.get("/admin/dashboard", headers=self.headers)
+            self.assertNotIn("config_notice", again.json())
+        self.assertEqual(self.client.post("/admin/config-notice/dismiss").status_code, 401)
 
     def test_export_only_selected_info_and_symlink_identity_protection(self):
         content = json.dumps(self.credential())
@@ -628,6 +727,8 @@ class AdminApiTests(unittest.TestCase):
     def test_logs_dashboard_clear_confirmations_and_404(self):
         self.assertEqual(self.client.get("/admin/logs?kind=admin&limit=10&model=m", headers=self.headers).status_code, 200)
         self.audit.list_records.assert_called_once_with("admin", 10, None, model="m")
+        self.assertEqual(self.client.get("/admin/logs?kind=credit&type=income", headers=self.headers).status_code, 200)
+        self.audit.list_records.assert_called_with("credit", 50, None, type="income")
         self.assertEqual(self.client.get("/admin/logs/missing", headers=self.headers).status_code, 404)
         self.assertEqual(self.client.get("/admin/dashboard?days=7", headers=self.headers).status_code, 200)
         self.assertEqual(self.client.get("/admin/dashboard?days=8", headers=self.headers).status_code, 400)
@@ -655,6 +756,36 @@ class AdminApiTests(unittest.TestCase):
         response = self.client.post("/admin/models/upstream/preview", headers=self.headers, json={})
         self.assertEqual(response.status_code, 400)
         self.assertNotIn("synthetic-secret-token", response.text)
+
+
+class StorageAdminTests(AdminApiTests):
+    def test_storage_reports_sizes_and_archive_listing(self):
+        self.audit.storage.return_value = {"db_bytes": 10, "wal_bytes": 0, "reclaimable_bytes": 4096,
+                                           "degraded": False}
+        self.audit.path = self.root / "logs.sqlite3"
+        (self.root / "archives").mkdir()
+        (self.root / "archives" / "audit-20260101-000000-deadbeef.jsonl").write_text("{}\n")
+        response = self.client.get("/admin/storage", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["reclaimable_bytes"], 4096)
+        self.assertEqual(data["archives"], ["audit-20260101-000000-deadbeef.jsonl"])
+
+    def test_storage_archive_validates_window_and_reports_result(self):
+        self.audit.archive.return_value = {"ok": True, "archived_requests": 2,
+                                           "archived_events": 1, "file": "audit-x.jsonl"}
+        response = self.client.post("/admin/storage/archive", headers=self.headers, json={"days": 30})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["archived_requests"], 2)
+        self.audit.archive.assert_called_once_with(30)
+        for bad in (0, 3651, "30", 1.5, True):
+            self.assertEqual(
+                self.client.post("/admin/storage/archive", headers=self.headers,
+                                 json={"days": bad}).status_code, 400)
+        self.audit.archive.return_value = {"ok": False}
+        self.assertEqual(
+            self.client.post("/admin/storage/archive", headers=self.headers,
+                             json={"days": 30}).status_code, 503)
 
 
 if __name__ == "__main__":

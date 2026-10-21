@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { api, type ModelRule } from "./api";
 import { ModelEditor, validateRule } from "./pages/Models";
+import { choose } from "./test-utils";
 
 const rule: ModelRule = {
   id: "source",
@@ -38,7 +39,7 @@ describe("independent model routes", () => {
     fireEvent.change(screen.getByLabelText("对外 ID"), { target: { value: "my-client-model" } });
     fireEvent.change(screen.getByLabelText("上游 ID"), { target: { value: "provider-model" } });
     fireEvent.click(screen.getByRole("radio", { name: /指定区域/ }));
-    fireEvent.change(screen.getByLabelText("区域"), { target: { value: "intl" } });
+    choose(screen.getByLabelText("区域"), "intl");
     fireEvent.click(screen.getByRole("button", { name: "创建模型" }));
     await waitFor(() =>
       expect(post).toHaveBeenCalledWith(
@@ -61,8 +62,8 @@ describe("independent model routes", () => {
     editor({ ...rule, credential_ids: ["one"] });
     fireEvent.click(screen.getByRole("radio", { name: /指定区域/ }));
     expect(screen.queryByRole("checkbox", { name: /one.info/ })).toBeNull();
-    fireEvent.change(screen.getByLabelText("区域"), { target: { value: "intl" } });
-    fireEvent.change(screen.getByLabelText("产品"), { target: { value: "intl-work" } });
+    choose(screen.getByLabelText("区域"), "intl");
+    choose(screen.getByLabelText("产品"), "intl-work");
     fireEvent.click(screen.getByRole("radio", { name: /指定账号/ }));
     expect(screen.queryByLabelText("区域")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "保存规则" }));

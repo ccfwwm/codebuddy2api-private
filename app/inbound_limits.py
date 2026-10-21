@@ -9,8 +9,15 @@ import json
 import asyncio
 
 
-_GATED_PATHS = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
+from app.request_context import PATHS
+
+_GATED_PATHS = tuple(PATHS)
 _BODY_PATHS = (*_GATED_PATHS, "/v1/messages/count_tokens")
+
+
+def anthropic_path(path: str) -> bool:
+    """True for entrypoints whose errors and admission notes use the Anthropic envelope."""
+    return path.startswith("/v1/messages")
 
 
 class ConcurrencyLimitMiddleware:
@@ -44,7 +51,7 @@ class ConcurrencyLimitMiddleware:
             error = {"message": "inference concurrency limit reached, retry later",
                      "type": "rate_limit_error", "code": "concurrency_limit"}
             payload = {"error": error}
-            if scope["path"] == "/v1/messages":
+            if anthropic_path(scope["path"]):
                 error["type"] = "api_error"
                 payload["type"] = "error"
             raw = json.dumps(payload).encode()
@@ -105,7 +112,7 @@ class InboundBodyLimitMiddleware:
     @staticmethod
     async def _reject(send, path: str, limit: int):
         # Middleware builds protocol-shaped errors before routing.
-        if path.startswith("/v1/messages"):
+        if anthropic_path(path):
             payload = {"type": "error", "error": {"type": "invalid_request_error",
                                                   "message": f"request body exceeds {limit} bytes",
                                                   "code": "request_too_large"}}

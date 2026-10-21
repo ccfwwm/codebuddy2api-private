@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 from app.admin_auth import AdminAuth, SessionStoreError
+from app.catalog_probe import AggregateCatalog
 from app.control_store import ControlStore
 from app.credential_cooldowns import CredentialCooldowns
 from app.credits import CreditLedger, ModelCatalogCache
@@ -69,6 +70,10 @@ class SQLiteStateTests(unittest.TestCase):
         usage = UsageSnapshots(self.root / LEGACY_FILES["usage"])
         usage.store("fixture.info", IDENTITY, "domestic", {"total_credits": 12, "requests": 2,
                     "by_day": {"2026-09-22": {"model": 12}}}, partial=True)
+        probe = self.root / LEGACY_FILES["catalog_probe"]
+        probe.write_text(json.dumps({"version": 1, "profiles": {"cn-cli": {
+            "source": IDENTITY, "source_generation": 1, "fetched_at": self.now,
+            "retry_at": self.now + 300, "failures": 0, "status": "ok", "models": ["model"]}}}))
         trial = TrialLedger(self.root / LEGACY_FILES["trial"])
         self.assertTrue(trial.begin(IDENTITY))
         trial.finish(IDENTITY, {"ok": True, "already": False, "code": 0, "status": 200})
@@ -90,6 +95,7 @@ class SQLiteStateTests(unittest.TestCase):
         self.assertGreater(cooldowns.credential_until(IDENTITY, "cn-work"), self.now)
         self.assertGreater(cooldowns.model_until(IDENTITY, "cn-work", "model"), self.now)
         self.assertTrue(UsageSnapshots(store=self.state).accounts()["fixture.info"]["partial"])
+        self.assertEqual(AggregateCatalog(store=self.state).row("cn-cli")["source"], IDENTITY)
         trial = TrialLedger(store=self.state)
         self.assertFalse(trial.begin(IDENTITY, self.now + 3 * 86400))
         auth = AdminAuth({"api_key": FIXED_KEY, "state_store": self.state})
@@ -107,7 +113,7 @@ class SQLiteStateTests(unittest.TestCase):
         auth.reconcile()
         self.assertNotIn(sid, auth.sessions)
         self.assertEqual(before, {name: (self.root / file).read_bytes() for name, file in LEGACY_FILES.items()})
-        self.assertEqual(self.control._db.execute("SELECT count(*) FROM state_imports").fetchone()[0], 7)
+        self.assertEqual(self.control._db.execute("SELECT count(*) FROM state_imports").fetchone()[0], 8)
 
     def test_absent_legacy_file_cannot_resurrect_later(self):
         self.state.migrate(self.root)

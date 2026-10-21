@@ -99,7 +99,7 @@ import converter, json, sys
 from unittest.mock import patch
 sys.argv = ['converter.py', '--skip-check', '--auto-trial', 'true']
 with patch.object(converter.threading.Thread, 'start'), patch.object(converter, 'seed_credentials'), \\
-     patch.object(converter.uvicorn, 'run'), patch.object(converter.trial_rewards, 'claim_trial') as claim:
+     patch.object(converter, 'run_server'), patch.object(converter.trial_rewards, 'claim_trial') as claim:
     converter.main()
     assert not converter.CONFIG.get('auto_trial')
     assert converter.CONFIG.get('trial_ledger') is not None

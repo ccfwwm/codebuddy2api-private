@@ -1,21 +1,95 @@
 """Observe inference metadata with bounded response parsing; never inspect request bodies or headers.
+
+The only headers read are audit client metadata (user-agent and forwarded-for
+chains behind a configured trusted proxy); they are never forwarded upstream.
 Preserve the ASGI wire and exclude credential files or tokens from route metadata.
 """
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import json
 import time
 from typing import Any
 
-from app.audit_store import AuditStore, METRICS, number, safe_attempt, safe_label
-from app.request_context import current_context, ensure_context
+from app.audit_store import AuditStore, METRICS, number, safe_agent, safe_attempt, safe_label
+from app.request_context import PATHS, current_context, ensure_context
 
-_PATHS = {"/v1/chat/completions": "chat", "/v1/responses": "responses", "/v1/messages": "messages"}
 _PARSE_LIMIT = 16384
+_META_HEADERS = ("user-agent", "x-forwarded-for", "x-real-ip")
+_proxy_networks: dict[str, tuple] = {}
 _current: ContextVar[_Observation | None] = ContextVar("audit_observation", default=None)
+
+
+def _trusted_networks(raw):
+    """Parse a normalized trusted_proxies setting; cached per setting value."""
+    if not isinstance(raw, str) or not raw.strip():
+        return ()
+    cached = _proxy_networks.get(raw)
+    if cached is None:
+        import ipaddress
+        try:
+            cached = tuple(ipaddress.ip_network(entry.strip(), strict=False)
+                           for entry in raw.split(",") if entry.strip())
+        except ValueError:
+            return ()
+        if len(_proxy_networks) > 8:
+            _proxy_networks.clear()
+        _proxy_networks[raw] = cached
+    return cached
+
+
+def client_meta(scope, trusted_proxies):
+    """(client_ip, user_agent) for the audit record.
+
+    Forwarded headers count only when the direct peer is a trusted proxy;
+    otherwise they are ignored so clients cannot spoof their address.
+    """
+    headers = {}
+    forwarded: list[str] = []
+    for key, value in scope.get("headers") or []:
+        name = key.decode("latin-1").lower() if isinstance(key, (bytes, bytearray)) else str(key).lower()
+        clean = value.decode("latin-1", "replace").strip() if isinstance(value, (bytes, bytearray)) else str(value).strip()
+        if name == "x-forwarded-for":
+            # A trusted proxy may append its hop as a separate header field;
+            # combine the fields in order before walking the chain.
+            if clean:
+                forwarded.append(clean)
+        elif name in _META_HEADERS and name not in headers:
+            headers[name] = clean
+    client = scope.get("client")
+    remote = client[0] if client and isinstance(client[0], str) else None
+
+    def valid_ip(candidate: str | None) -> str | None:
+        try:
+            return str(ipaddress.ip_address(candidate)) if candidate else None
+        except ValueError:
+            return None
+
+    remote_ip = valid_ip(remote)
+    remote_obj = ipaddress.ip_address(remote_ip) if remote_ip else None
+    networks = _trusted_networks(trusted_proxies)
+    ip = remote
+    if remote_obj is not None and any(remote_obj in network for network in networks):
+        hops = [hop.strip() for hop in (",".join(forwarded)).split(",") if hop.strip()][-32:]
+        chosen = None
+        broken = False
+        for hop in reversed(hops):
+            hop_ip = valid_ip(hop)
+            if hop_ip is None:
+                # A malformed hop breaks the chain; never fall back to the
+                # client-controlled leftmost entry in that case.
+                broken = True
+                break
+            chosen = hop_ip
+            if not any(ipaddress.ip_address(hop_ip) in network for network in networks):
+                break
+        if chosen is None or broken:
+            chosen = valid_ip(headers.get("x-real-ip"))
+        ip = chosen or remote
+    return ip, safe_agent(headers.get("user-agent"))
 
 
 def _mapping(value):
@@ -28,9 +102,6 @@ def normalize_usage(usage):
     result = {}
     aliases = {"input_tokens": ("input_tokens", "prompt_tokens"),
                "output_tokens": ("output_tokens", "completion_tokens"),
-               "cache_read_tokens": ("cache_read_tokens", "cache_read_input_tokens", "cached_tokens", "cache"),
-               "cache_creation_tokens": ("cache_creation_tokens", "cache_creation_input_tokens"),
-               "reasoning_tokens": ("reasoning_tokens", "reasoning"),
                "total_tokens": ("total_tokens",), "credit": ("credit",)}
     for key, names in aliases.items():
         for name in names:
@@ -38,16 +109,29 @@ def normalize_usage(usage):
             if value is not None:
                 result[key] = value
                 break
-    for key, parents, child in (
-        ("cache_read_tokens", ("input_tokens_details", "prompt_tokens_details"), "cached_tokens"),
-        ("reasoning_tokens", ("output_tokens_details", "completion_tokens_details"), "reasoning_tokens"),
-    ):
-        if key not in result:
-            for parent in parents:
-                value = number(_mapping(usage.get(parent)).get(child))
-                if value is not None:
-                    result[key] = value
-                    break
+    # Providers report cache/reasoning counters through several fields at once,
+    # and some ship a permanent zero alias next to the real counter (CodeBuddy's
+    # top-level cached_tokens: 0 beside prompt_tokens_details.cached_tokens).
+    # The largest candidate wins so a broken zero cannot shadow a real value.
+    best_of = {
+        "cache_read_tokens": (
+            ("cache_read_tokens", "cache_read_input_tokens", "cached_tokens", "cache",
+             "prompt_cache_hit_tokens"),
+            ((("input_tokens_details", "prompt_tokens_details"), "cached_tokens"),)),
+        "cache_creation_tokens": (
+            ("cache_creation_tokens", "cache_creation_input_tokens", "prompt_cache_write_tokens"),
+            ()),
+        "reasoning_tokens": (
+            ("reasoning_tokens", "reasoning", "completion_thinking_tokens"),
+            ((("output_tokens_details", "completion_tokens_details"), "reasoning_tokens"),)),
+    }
+    for key, (names, nested) in best_of.items():
+        candidates = [number(usage.get(name)) for name in names]
+        for parents, child in nested:
+            candidates += [number(_mapping(usage.get(parent)).get(child)) for parent in parents]
+        present = [value for value in candidates if value is not None]
+        if present:
+            result[key] = max(present)
     return result
 
 
@@ -62,6 +146,7 @@ class _Observation:
     body_finished: bool = False
     status: int | None = None
     streaming: bool = False
+    discarded: bool = False
     first_token_ms: float | None = None
     usage_priority: dict = field(default_factory=dict)
     usage_sources: dict = field(default_factory=dict)
@@ -130,11 +215,30 @@ class _Observation:
                     self.output()
 
 
+def observe_discard():
+    """Drop the current observation at submit time; for housekeeping traffic that must not pollute stats."""
+    observation = _current.get()
+    if observation is not None:
+        observation.discarded = True
+
+
 def observe_stream_mode(mode):
     """Attach one allowlisted request marker without consuming bounded attempt diagnostics."""
     observation = _current.get()
     if observation is not None and mode in ("compatible", "realtime"):
         observation.record["stream_mode"] = mode
+
+
+def observe_responses_projection(stats):
+    """Record non-sensitive Responses projection counters for audit details."""
+    observation = _current.get()
+    if observation is None or not isinstance(stats, dict):
+        return
+    mode = stats.get("mode")
+    if mode in ("balanced", "passthrough"):
+        observation.record["responses_projection_mode"] = mode
+    observation.record["responses_projection_max_bytes"] = number(stats.get("max_item_bytes"))
+    observation.record["responses_truncated_items"] = number(stats.get("truncated_items"))
 
 
 def observe_route(public_model, upstream_model, profile, credential):
@@ -313,14 +417,17 @@ class AuditMiddleware:
             await self.app(scope, lifespan_receive, send)
             return
         if (self.store is None or scope.get("type") != "http" or scope.get("method") != "POST"
-                or scope.get("path") not in _PATHS):
+                or scope.get("path") not in PATHS):
             await self.app(scope, receive, send)
             return
         started, monotonic_start = time.time(), time.monotonic()
         observation = _Observation({"id": ensure_context(scope, self.config).request_id, "epoch": -1,
                                     "detail_generation": -1, "started_at": started,
-                                    "protocol": _PATHS[scope["path"]],
+                                    "protocol": PATHS[scope["path"]],
                                     **{key: None for key in METRICS}}, monotonic_start)
+        observation.record.update(zip(("client_ip", "user_agent"),
+                                      client_meta(scope, self.config.get("trusted_proxies")
+                                                  if isinstance(self.config, dict) else None)))
         token = _current.set(observation)
         parser = _Parser(observation)
         cancelled = False
@@ -377,35 +484,37 @@ class AuditMiddleware:
             observation.fail("application_error")
             raise
         finally:
-            try:
-                if not observation.body_finished and not cancelled and not observation.failed:
-                    observation.fail("incomplete_response")
-                if observation.streaming and not observation.terminal and not cancelled and not observation.failed:
-                    observation.fail("incomplete_stream")
-                outcome = "cancelled" if cancelled else (
-                    "error" if observation.failed or not observation.status or observation.status >= 400 else "success")
-                observation.record.update(status_code=observation.status, outcome=outcome,
-                                          streaming=observation.streaming,
-                                          duration_ms=(time.monotonic() - monotonic_start) * 1000,
-                                          first_token_ms=observation.first_token_ms,
-                                          attempts=observation.attempts)
-                if observation.parser_dropped:
-                    observation.record["attempts"] = observation.attempts + [{"stage": "observer", "code": "bounded_parse_skipped"}]
-                # Shield one bounded store operation from client cancellation.
-                # No upstream replay and no promise of delivery after process exit.
-                task = asyncio.create_task(asyncio.to_thread(self.store.record_request, observation.record))
-                self._pending.add(task)
-                task.add_done_callback(self._pending.discard)
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    # The thread continues; retain the task and consume its error.
-                    task.add_done_callback(self._submission_done)
-                    raise
-                except Exception:
-                    self._fault()
-            finally:
-                _current.reset(token)
+            _current.reset(token)
+            if not observation.discarded:
+                await self._submit(observation, monotonic_start, cancelled)
+
+    async def _submit(self, observation, monotonic_start, cancelled):
+        if not observation.body_finished and not cancelled and not observation.failed:
+            observation.fail("incomplete_response")
+        if observation.streaming and not observation.terminal and not cancelled and not observation.failed:
+            observation.fail("incomplete_stream")
+        outcome = "cancelled" if cancelled else (
+            "error" if observation.failed or not observation.status or observation.status >= 400 else "success")
+        observation.record.update(status_code=observation.status, outcome=outcome,
+                                  streaming=observation.streaming,
+                                  duration_ms=(time.monotonic() - monotonic_start) * 1000,
+                                  first_token_ms=observation.first_token_ms,
+                                  attempts=observation.attempts)
+        if observation.parser_dropped:
+            observation.record["attempts"] = observation.attempts + [{"stage": "observer", "code": "bounded_parse_skipped"}]
+        # Shield one bounded store operation from client cancellation.
+        # No upstream replay and no promise of delivery after process exit.
+        task = asyncio.create_task(asyncio.to_thread(self.store.record_request, observation.record))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # The thread continues; retain the task and consume its error.
+            task.add_done_callback(self._submission_done)
+            raise
+        except Exception:
+            self._fault()
 
     def _submission_done(self, task):
         try:

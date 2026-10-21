@@ -18,6 +18,10 @@ COPY web/ ./
 # Bound native checker concurrency independently of the build host CPU count.
 RUN GOMAXPROCS=2 GOMEMLIMIT=512MiB RAYON_NUM_THREADS=2 vp check && vp test run && vp build
 
+# CI overrides this stage with the already tested build via --build-context webui=web/dist.
+FROM scratch AS webui
+COPY --from=frontend /web/dist/ /
+
 FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea AS runtime
 WORKDIR /app
 ENV CODEBUDDY_AUTH_DIR=/data/auth
@@ -26,8 +30,12 @@ RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requireme
 COPY VERSION ./
 COPY converter.py ./
 COPY app/ ./app/
-COPY --from=frontend /web/dist/ ./web/dist/
+COPY --from=webui / ./web/dist/
+# Where the image came from; the Updates page warns when an edge (main) image installs a release.
+ARG BUILD_CHANNEL=local
+ARG BUILD_COMMIT=
+RUN printf '{"channel": "%s", "commit": "%s", "version": "%s"}' "$BUILD_CHANNEL" "$BUILD_COMMIT" "$(cat VERSION)" > build.json
 EXPOSE 8787
 # Listen on container interfaces; host port mapping controls external access.
 ENV CODEBUDDY2API_ALLOW_OPEN_NOAUTH=true
-CMD ["python3", "converter.py", "--host", "0.0.0.0", "--port", "8787", "--skip-check"]
+CMD ["python3", "converter.py", "--host", "0.0.0.0", "--port", "8787", "--skip-check", "--desensitize"]

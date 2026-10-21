@@ -40,3 +40,6 @@ converter.log*
 
 # IDE
 .idea/
+
+# One-click update staging directory
+/.update/

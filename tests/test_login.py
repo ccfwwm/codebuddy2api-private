@@ -71,7 +71,7 @@ class LoginTests(unittest.TestCase):
         pool = converter.CredentialPool(scan=True)
         with patch.object(converter, "_OAUTH", self.manager("www.workbuddy.ai")), \
                 patch("sys.argv", ["converter.py", "login", "--site", "intl", "--no-browser"]), \
-                patch("converter.uvicorn.run") as server, patch("converter.threading.Thread") as thread:
+                patch("converter.run_server") as server, patch("converter.threading.Thread") as thread:
             self.assertEqual(converter.main(), 0)
         server.assert_not_called()
         thread.assert_not_called()
@@ -84,6 +84,7 @@ class LoginTests(unittest.TestCase):
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
         self.assertIsNone(pool.pick(None, region="cn"))  # Never treat international credentials as domestic.
+        pool.reconcile()  # Background reconcile discovers the file the login command just saved.
         self.assertEqual(pool.pick(None).summary()["uid"], "u1")
         self.assertIn("账号已保存", self.stdout.getvalue())
         self.assert_no_tokens_printed()
@@ -93,7 +94,7 @@ class LoginTests(unittest.TestCase):
         for site, domain in (("intl", "www.workbuddy.ai"), ("intl-codebuddy", "www.codebuddy.ai")):
             with self.subTest(site=site), patch.object(converter, "_OAUTH", self.manager(domain)), \
                     patch("sys.argv", ["converter.py", "login", "--site", site, "--no-browser"]), \
-                    patch("converter.uvicorn.run") as server, patch("converter.threading.Thread") as thread:
+                    patch("converter.run_server") as server, patch("converter.threading.Thread") as thread:
                 self.polls = 0
                 self.assertEqual(converter.main(), 0)
                 server.assert_not_called()

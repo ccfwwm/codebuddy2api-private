@@ -1,10 +1,24 @@
 import { useState } from "react";
-import { list, metric, number, object, text, useResource, type RecordValue } from "../api";
+import {
+  api,
+  errorMessage,
+  list,
+  metric,
+  number,
+  object,
+  text,
+  useResource,
+  type RecordValue,
+} from "../api";
 import {
   Badge,
+  Drawer,
+  DrawerPresence,
   Empty,
+  ErrorNotice,
   Fields,
   Icon,
+  RefreshIcon,
   PageTitle,
   Panel,
   ResourceState,
@@ -13,12 +27,14 @@ import {
 import s from "../ui.module.scss";
 function normalize(value: unknown): RecordValue & {
   summary: RecordValue;
+  previous: RecordValue | null;
   series: RecordValue[];
   models: RecordValue[];
   profiles: RecordValue[];
   health: RecordValue;
   storage: RecordValue;
   range: RecordValue;
+  config_notice: RecordValue | null;
 } {
   const d = object(value);
   for (const field of ["series", "models", "profiles"]) {
@@ -27,21 +43,28 @@ function normalize(value: unknown): RecordValue & {
   }
   return {
     ...d,
-    summary: object(d.summary, "统计"),
+    summary: object(d.summary, t("dash.summary")),
+    previous:
+      d.previous === null || d.previous === undefined ? null : object(d.previous, "上周期汇总"),
     series: list(d.series, "趋势"),
     models: list(d.models, "模型排行"),
-    profiles: list(d.profiles, "产品分布"),
+    profiles: list(d.profiles, t("dash.profileUsage")),
     health: object(d.health, "健康状态"),
     storage: object(d.storage, "存储状态"),
-    range: d.range === undefined ? {} : object(d.range, "统计窗口"),
+    range: d.range === undefined ? {} : object(d.range, t("dash.window")),
+    config_notice:
+      d.config_notice === undefined || d.config_notice === null
+        ? null
+        : object(d.config_notice, t("dash.configNoticeTitle")),
   };
 }
 function Health({ data }: { data: RecordValue }) {
+  const t = useT();
   if (!Array.isArray(data.credentials)) return <Fields data={data} />;
   const credentials = list(data.credentials);
-  if (!credentials.length) return <Empty title="尚未添加凭证" />;
+  if (!credentials.length) return <Empty title={t("dash.credentialHealthEmpty")} />;
   return (
-    <div className={s.healthList}>
+    <div className={`${s.healthList} ${s.panelScroll}`}>
       {credentials.map((c, i) => (
         <div key={i}>
           <div>
@@ -50,10 +73,14 @@ function Health({ data }: { data: RecordValue }) {
           </div>
           <div>
             <Badge tone={c.enabled === false ? "neutral" : c.health === "ready" ? "good" : "warn"}>
-              {c.enabled === false ? "人工停用" : c.health === "ready" ? "就绪" : text(c.health)}
+              {c.enabled === false
+                ? t("dash.status.manual")
+                : c.health === "ready"
+                  ? t("dash.status.ready")
+                  : text(c.health)}
             </Badge>
             {Array.isArray(c.cooldowns) && c.cooldowns.length > 0 && (
-              <small>{c.cooldowns.length} 个模型冷却</small>
+              <small>{t("dash.modelCooldowns", { n: c.cooldowns.length })}</small>
             )}
           </div>
         </div>
@@ -62,16 +89,17 @@ function Health({ data }: { data: RecordValue }) {
   );
 }
 function OfficialCredits({ value }: { value: unknown }) {
+  const t = useT();
   const rows = Object.entries(object(value));
-  if (!rows.length) return <Empty title="暂无官方余额快照" />;
+  if (!rows.length) return <Empty title={t("dash.balanceSnapshotEmpty")} />;
   return (
-    <div className={s.tableWrap}>
+    <div className={`${s.tableWrap} ${s.panelScroll}`}>
       <table>
         <thead>
           <tr>
-            <th>凭证</th>
-            <th>官方余额</th>
-            <th>同步状态</th>
+            <th>{t("dash.credentials")}</th>
+            <th>{t("dash.balance")}</th>
+            <th>{t("dash.syncStatus")}</th>
           </tr>
         </thead>
         <tbody>
@@ -81,15 +109,19 @@ function OfficialCredits({ value }: { value: unknown }) {
             return (
               <tr key={key}>
                 <td>{typeof row.name === "string" ? row.name : key.split(/[\\/]/).at(-1)}</td>
-                <td>{metric(credits?.credits ?? credits?.remaining)}</td>
+                <td>
+                  {credits?.unlimited && credits?.enterprise
+                    ? t("dash.unlimited")
+                    : metric(credits?.credits ?? credits?.remaining)}
+                </td>
                 <td>
                   {row.error ? (
-                    <Badge tone="warn">同步异常</Badge>
+                    <Badge tone="warn">{t("dash.status.syncError")}</Badge>
                   ) : (
                     <span>
                       {typeof row.fetched_at === "number"
                         ? new Date(row.fetched_at * 1000).toLocaleString("zh-CN")
-                        : "同步时间未知"}
+                        : t("dash.syncTimeUnknown")}
                     </span>
                   )}
                 </td>
@@ -101,96 +133,182 @@ function OfficialCredits({ value }: { value: unknown }) {
     </div>
   );
 }
-function bytes(value: unknown) {
-  const n = number(value);
-  if (n === null) return "未知";
-  if (n < 1024) return `${metric(n)} B`;
-  if (n < 1048576) return `${(n / 1024).toFixed(1)} KiB`;
-  return `${(n / 1048576).toFixed(1)} MiB`;
+import { KpiCards, UsageTrend } from "../UsageOverview";
+import { t, useT } from "../i18n";
+import { Select } from "../fields";
+
+function ConfigNotice({ notice, onDismiss }: { notice: RecordValue; onDismiss: () => void }) {
+  const t = useT();
+  const [copied, setCopied] = useState(false);
+  const items = list(notice.items, t("dash.configNoticeTitle"));
+  const keys = items.map((item) => text(item.key)).join("、");
+  const command = text(notice.command);
+  const count = number(notice.count) ?? items.length;
+  return (
+    <div className={s.warning} role="status">
+      <Icon name="alert" />
+      <div>
+        <strong>{t("dash.configNoticeTitle")}</strong>
+        <p>{t("dash.configNoticeBody", { count: String(count), keys })}</p>
+        <p className={s.note}>
+          <code>{command}</code>
+        </p>
+        <div className={s.actions}>
+          <button
+            type="button"
+            onClick={() => {
+              const clipboard = navigator.clipboard;
+              if (!clipboard) return;
+              void clipboard.writeText(command).then(
+                () => setCopied(true),
+                () => setCopied(false),
+              );
+            }}
+          >
+            {copied ? t("dash.configNoticeCopied") : t("dash.configNoticeCopy")}
+          </button>
+          <button type="button" onClick={onDismiss}>
+            {t("dash.configNoticeDismiss")}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
-import { Trend } from "../Trend";
+
+function ConfigNoticeConfirm({
+  notice,
+  onClose,
+  onDismissed,
+}: {
+  notice: RecordValue;
+  onClose: () => void;
+  onDismissed: () => void;
+}) {
+  const t = useT();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const count = number(notice.count) ?? list(notice.items).length;
+  return (
+    <Drawer title={t("dash.configNoticeConfirmTitle")} onClose={onClose} dismissDisabled={busy}>
+      <div className={s.warning}>
+        <Icon name="alert" />
+        <div>
+          <strong>{t("dash.configNoticeConfirmStrong", { count: String(count) })}</strong>
+          <p>{t("dash.configNoticeConfirmBody", { count: String(count) })}</p>
+        </div>
+      </div>
+      <ErrorNotice message={error} />
+      <div className={s.actions}>
+        <button type="button" disabled={busy} onClick={onClose}>
+          {t("dash.configNoticeCancel")}
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            setError(null);
+            void api
+              .post("/config-notice/dismiss", {})
+              .then(() => onDismissed())
+              .catch((err: unknown) => setError(errorMessage(err)))
+              .finally(() => setBusy(false));
+          }}
+        >
+          {busy ? t("dash.configNoticeConfirming") : t("dash.configNoticeConfirm")}
+        </button>
+      </div>
+    </Drawer>
+  );
+}
 export { Trend } from "../Trend";
 export function Dashboard() {
+  const t = useT();
   const [days, setDays] = useState("7");
   const [granularity, setGranularity] = useState("auto");
+  const [noticeHidden, setNoticeHidden] = useState(false);
+  const [confirmingNotice, setConfirmingNotice] = useState(false);
   const resource = useResource(`/dashboard?days=${days}&granularity=${granularity}`, normalize);
+  // Hourly buckets power the trend's zoom-in granularity swap.
+  const hourly = useResource(`/dashboard?days=${days}&granularity=hour`, normalize);
   const d = resource.data;
   const period = d?.range ?? {};
   const actualGrain = period.granularity === "hour" ? "hour" : "day";
-  const rate = number(d?.summary.success_rate);
   return (
     <>
       <PageTitle
-        title="运行概览"
+        title={t("dash.runtime")}
         actions={
           <>
-            <select
-              aria-label="统计时间范围"
-              value={days}
-              onChange={(e) => setDays(e.target.value)}
-            >
+            <Select aria-label={t("dash.range")} value={days} onChange={(value) => setDays(value)}>
               {["1", "7", "30", "90"].map((n) => (
                 <option value={n} key={n}>
-                  最近 {n} 天
+                  {t("dash.lastNDays", { n })}
                 </option>
               ))}
-            </select>
-            <select
-              aria-label="统计粒度"
+            </Select>
+            <Select
+              aria-label={t("dash.granularity")}
               value={granularity}
-              onChange={(e) => setGranularity(e.target.value)}
+              onChange={(value) => setGranularity(value)}
             >
-              <option value="auto">自动粒度</option>
-              <option value="hour">按小时</option>
-              <option value="day">按天</option>
-            </select>
-            <button onClick={resource.reload}>
-              <Icon name="refresh" />
-              刷新
+              <option value="auto">{t("dash.granularityAuto")}</option>
+              <option value="hour">{t("dash.granularityHour")}</option>
+              <option value="day">{t("dash.granularityDay")}</option>
+            </Select>
+            <button
+              onClick={() => {
+                resource.reload();
+                hourly.reload();
+              }}
+            >
+              <RefreshIcon spinning={resource.refreshing || hourly.refreshing} />
+              {t("dash.refresh")}
             </button>
           </>
         }
       />
       <ResourceState {...resource} />
+      {d?.config_notice && !noticeHidden && (
+        <ConfigNotice notice={d.config_notice} onDismiss={() => setConfirmingNotice(true)} />
+      )}
+      <DrawerPresence>
+        {confirmingNotice && d?.config_notice && (
+          <ConfigNoticeConfirm
+            notice={d.config_notice}
+            onClose={() => setConfirmingNotice(false)}
+            onDismissed={() => {
+              setNoticeHidden(true);
+              setConfirmingNotice(false);
+            }}
+          />
+        )}
+      </DrawerPresence>
       {d && (
         <>
           {(d.degraded === true || d.storage.degraded === true) && (
             <div className={s.warning} role="alert">
-              统计可能不完整，请检查日志存储状态。
+              {t("dash.storageDegraded")}
             </div>
           )}
-          <div className={s.stats}>
-            {[
-              ["请求总量", metric(d.summary.requests), "arrow"],
-              ["成功率", rate === null ? "未知" : `${(rate * 100).toFixed(1)}%`, "shield"],
-              ["Token 用量", metric(d.summary.total_tokens), "model"],
-              ["网关已知 Credit", metric(d.summary.credit), "leaf"],
-            ].map(([label, value, icon]) => (
-              <section className={s.stat} key={label}>
-                <div>
-                  {label}
-                  <span>
-                    <Icon name={icon} />
-                  </span>
-                </div>
-                <strong>{value}</strong>
-              </section>
-            ))}
-          </div>
+          <KpiCards summary={d.summary} previous={d.previous} series={d.series} />
+          <Panel title={t("dash.usageTrend")} hint={t("dash.usageTrendHint")} className={s.trend}>
+            {period.partial === true && (
+              <p className={s.note} role="status">
+                {t("dash.storagePartial")}
+              </p>
+            )}
+            <UsageTrend
+              rows={d.series}
+              hourlyRows={hourly.data?.series}
+              hourlyPartial={hourly.data?.range?.partial === true}
+              granularity={actualGrain}
+              partial={period.partial === true}
+            />
+          </Panel>
           <div className={s.dashboardGrid}>
-            <Panel
-              title="请求趋势"
-              hint={`最近 ${days} 天 · UTC 自然日 · ${actualGrain === "hour" ? "按小时" : "按天"}`}
-              className={s.trend}
-            >
-              {period.partial === true && (
-                <p className={s.note} role="status">
-                  小时记录不完整，仅展示已记录时段；可切换按天查看完整统计。
-                </p>
-              )}
-              <Trend rows={d.series} granularity={actualGrain} partial={period.partial === true} />
-            </Panel>
-            <Panel title="产品分布" hint="按请求量">
+            <Panel title={t("dash.profileUsage")} hint={t("dash.granularityByRequests")}>
               {d.profiles.length ? (
                 <div className={s.distribution}>
                   {d.profiles.map((p, i) => {
@@ -205,24 +323,24 @@ export function Dashboard() {
                         <progress
                           max={total || 1}
                           value={count ?? 0}
-                          aria-label={`${profileLabel(text(p.profile))} 请求占比`}
+                          aria-label={`${profileLabel(text(p.profile))} ${t("dash.shareOfRequests")}`}
                         />
                       </div>
                     );
                   })}
                 </div>
               ) : (
-                <Empty title="暂无产品用量" />
+                <Empty title={t("dash.profileUsageEmpty")} />
               )}
             </Panel>
-            <Panel title="模型使用排行">
+            <Panel title={t("dash.modelRank")}>
               {d.models.length ? (
-                <div className={s.tableWrap}>
+                <div className={`${s.tableWrap} ${s.panelScroll}`}>
                   <table>
                     <thead>
                       <tr>
-                        <th>模型</th>
-                        <th>请求</th>
+                        <th>{t("dash.models")}</th>
+                        <th>{t("dash.requests")}</th>
                         <th>Token</th>
                         <th>Credit</th>
                       </tr>
@@ -235,7 +353,7 @@ export function Dashboard() {
                           <tr key={i}>
                             <td>
                               <span className={s.rank}>{String(i + 1).padStart(2, "0")}</span>
-                              <strong>{text(m.model) || "未识别模型"}</strong>
+                              <strong>{text(m.model) || t("dash.unknownModel")}</strong>
                             </td>
                             <td>{metric(m.requests)}</td>
                             <td>{metric(m.total_tokens)}</td>
@@ -246,63 +364,23 @@ export function Dashboard() {
                   </table>
                 </div>
               ) : (
-                <Empty title="尚无模型请求记录" />
+                <Empty title={t("dash.modelRankEmpty")} />
               )}
             </Panel>
-            <Panel title="凭证健康">
+            <Panel title={t("dash.credentialHealth")}>
               <Health data={d.health} />
             </Panel>
-            <Panel title="日志存储">
-              <div className={s.storageOverview}>
-                <Badge
-                  tone={
-                    d.storage.degraded === true
-                      ? "bad"
-                      : d.storage.degraded === false
-                        ? "good"
-                        : "neutral"
-                  }
-                >
-                  {d.storage.degraded === true
-                    ? "采集降级"
-                    : d.storage.degraded === false
-                      ? "正常"
-                      : "状态未知"}
-                </Badge>
-                <span>
-                  明细 {bytes(d.storage.logical_bytes)} / {bytes(d.storage.max_bytes)}
-                </span>
-              </div>
-              <Fields
-                data={{
-                  数据库文件: bytes(d.storage.db_bytes),
-                  "WAL 文件": bytes(d.storage.wal_bytes),
-                  "SHM 文件": bytes(d.storage.shm_bytes),
-                  保留天数: metric(d.storage.retention_days),
-                  清理状态:
-                    d.storage.pending_cleanup === true
-                      ? "分批清理中"
-                      : d.storage.pending_cleanup === false
-                        ? "已完成"
-                        : "未知",
-                }}
-              />
-              <details className={s.chartData}>
-                <summary>查看存储诊断</summary>
-                <Fields data={d.storage} />
-              </details>
-            </Panel>
-            <Panel title="官方账号余额">
-              <p className={s.note}>账号余额，并非本网关消费统计。</p>
+            <Panel title={t("dash.balanceTitle")}>
+              <p className={s.note}>{t("dash.balanceNote")}</p>
               {d.official_credits !== undefined ? (
                 <OfficialCredits value={d.official_credits} />
               ) : (
-                <p className={s.muted}>暂无余额数据，可在凭证管理查看。</p>
+                <p className={s.muted}>{t("dash.balanceEmpty")}</p>
               )}
             </Panel>
           </div>
           <p className={s.updated}>
-            更新于{" "}
+            {t("dash.updatedAt")}{" "}
             {typeof d.generated_at === "number"
               ? new Date(d.generated_at * 1000).toLocaleString("zh-CN")
               : text(d.generated_at)}{" "}

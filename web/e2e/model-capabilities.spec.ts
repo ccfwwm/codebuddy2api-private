@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { choose } from "./select";
 
 for (const width of [1440, 375]) {
   test(`model declarations, profile variants and preflight settings at ${width}px`, async ({
@@ -113,15 +114,15 @@ for (const width of [1440, 375]) {
     });
     await page.goto("/dashboard/models");
     await expect(page.getByText("能力预检：开启")).toBeVisible();
-    await expect(page.getByText("图片：因路由而异")).toBeVisible();
+    await expect(page.getByText("图片因路由而异")).toBeVisible();
     const trigger = page.getByRole("button", { name: "模型详情" });
     await trigger.click();
     const dialog = page.getByRole("dialog");
     await expect(dialog.getByText("仅用于浏览器回归的模型说明", { exact: true })).toBeVisible();
     await expect(dialog.getByText("可选强度", { exact: true })).toBeVisible();
-    await dialog.getByRole("combobox", { name: "查看产品声明" }).selectOption("intl-work");
+    await choose(dialog.getByRole("combobox", { name: "查看产品声明" }), "intl-work");
     await expect(dialog.getByRole("heading", { name: "声明 2" })).toBeVisible();
-    await dialog.getByRole("combobox", { name: "查看产品声明" }).selectOption("intl-cli");
+    await choose(dialog.getByRole("combobox", { name: "查看产品声明" }), "intl-cli");
     await expect(dialog.getByRole("heading", { name: "共享目录来源" })).toBeVisible();
     await dialog.getByText(/来源版本 1/).click();
     await expect(dialog.getByText("共享原始声明", { exact: true })).toBeVisible();
@@ -132,21 +133,18 @@ for (const width of [1440, 375]) {
     await page.keyboard.press("Escape");
     await expect(dialog).toHaveCount(0);
     await expect(trigger).toBeFocused();
-    await page.goto("/dashboard/settings");
-    const toggle = page.getByRole("checkbox", { name: /模型能力预检/ });
+    const toggle = page.getByRole("switch", { name: /模型能力预检/ });
     await expect(toggle).toBeChecked();
-    await toggle.uncheck();
     const saved = page.waitForResponse(
       (response) =>
         response.url().endsWith("/admin/settings") && response.request().method() === "PATCH",
     );
-    await page.getByRole("button", { name: "保存更改" }).click();
+    await toggle.click();
     expect((await saved).status()).toBe(200);
     await expect(toggle).not.toBeChecked();
     await expect(page.getByText(/国际图片归并及其他安全限制不变/)).toBeVisible();
-    await page.goto("/dashboard/models");
     await expect(page.getByText("能力预检：关闭")).toBeVisible();
-    await expect(page.getByText("图片：因路由而异")).toBeVisible();
+    await expect(page.getByText("图片因路由而异")).toBeVisible();
     expect(external).toEqual([]);
     expect(errors).toEqual([]);
   });

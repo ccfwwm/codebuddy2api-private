@@ -17,17 +17,22 @@ import {
   Empty,
   ErrorNotice,
   Fields,
-  Icon,
+  RefreshIcon,
+  SegmentThumb,
   PageTitle,
   Panel,
   ResourceState,
 } from "../components";
+import { eventActionLabel, eventKindLabel } from "../values";
+import { CreditFilters, CreditRow, useAccountNames } from "../CreditChanges";
 import { profiles } from "./Models";
 import s from "../ui.module.scss";
+import { t, useT } from "../i18n";
+import { SearchInput, Select } from "../fields";
 function normalize(value: unknown) {
   const data = object(value);
   if (typeof data.has_more !== "boolean" || (data.has_more && typeof data.next_cursor !== "string"))
-    throw new Error("日志分页响应不完整");
+    throw new Error(t("logs.pageIncomplete"));
   return {
     items: list(data.items),
     next_cursor: typeof data.next_cursor === "string" ? data.next_cursor : null,
@@ -35,11 +40,27 @@ function normalize(value: unknown) {
     degraded: data.degraded === true,
   };
 }
-const emptyFilters = { model: "", credential: "", profile: "", status: "", search: "" };
+const emptyFilters = {
+  model: "",
+  credential: "",
+  profile: "",
+  status: "",
+  client_ip: "",
+  type: "",
+  search: "",
+};
+const outcomeLabels: Record<string, string> = {
+  success: "logs.outcome.success",
+  error: "logs.outcome.error",
+  cancelled: "logs.outcome.cancelled",
+  warning: "logs.outcome.warning",
+};
 export function Logs() {
+  const t = useT();
   const [kind, setKind] = useState("request");
   const [draft, setDraft] = useState(emptyFilters);
   const [filters, setFilters] = useState(emptyFilters);
+  const names = useAccountNames(kind === "credit");
   const [cursors, setCursors] = useState<string[]>([]);
   const [detail, setDetail] = useState<RecordValue | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
@@ -68,7 +89,7 @@ export function Logs() {
     setDetailLoading(false);
     if (kind !== "request") return;
     if (typeof item.id !== "string") {
-      setDetailError("请求记录缺少 ID，无法加载详情");
+      setDetailError(t("logs.detailNeedsId"));
       return;
     }
     const controller = new AbortController();
@@ -93,22 +114,24 @@ export function Logs() {
   return (
     <>
       <PageTitle
-        title="日志审计"
+        title={t("logs.title")}
         actions={
           <>
             <button onClick={resource.reload}>
-              <Icon name="refresh" />
-              刷新
+              <RefreshIcon spinning={resource.refreshing} />
+              {t("logs.refresh")}
             </button>
-            <button onClick={() => setClear(true)}>清理日志</button>
+            <button onClick={() => setClear(true)}>{t("logs.clear")}</button>
           </>
         }
       />
-      <div className={s.tabs} role="tablist" aria-label="日志类型">
+      <div className={s.tabs} role="tablist" aria-label={t("logs.logTypes")}>
+        <SegmentThumb />
         {[
-          ["request", "请求审计"],
-          ["runtime", "运行事件"],
-          ["admin", "管理操作"],
+          ["request", t("logs.tab.request")],
+          ["runtime", t("logs.tab.runtime")],
+          ["admin", t("logs.kind.admin")],
+          ["credit", t("logs.tab.credit")],
         ].map(([value, label]) => (
           <button
             key={value}
@@ -128,8 +151,16 @@ export function Logs() {
         ))}
       </div>
       <Panel
-        title={kind === "request" ? "请求记录" : kind === "runtime" ? "运行事件" : "管理操作记录"}
-        hint="每页 50 条"
+        title={
+          kind === "request"
+            ? t("logs.panel.request")
+            : kind === "runtime"
+              ? t("logs.tab.runtime")
+              : kind === "credit"
+                ? t("logs.panel.credit")
+                : t("logs.tab.admin")
+        }
+        hint={t("logs.perPage")}
       >
         <form
           className={s.filters}
@@ -142,47 +173,61 @@ export function Logs() {
           {kind === "request" && (
             <>
               <input
-                aria-label="筛选模型"
-                placeholder="模型 ID"
+                aria-label={t("logs.filter.model")}
+                placeholder={t("logs.placeholder.model")}
                 value={draft.model}
                 onChange={(e) => setDraft({ ...draft, model: e.target.value })}
               />
               <input
-                aria-label="筛选凭证"
-                placeholder="凭证 account_key"
+                aria-label={t("logs.filter.credential")}
+                placeholder={t("logs.placeholder.credential")}
                 value={draft.credential}
                 onChange={(e) => setDraft({ ...draft, credential: e.target.value })}
               />
-              <select
-                aria-label="筛选产品"
+              <input
+                aria-label={t("logs.filter.clientIp")}
+                placeholder={t("logs.placeholder.clientIp")}
+                value={draft.client_ip}
+                onChange={(e) => setDraft({ ...draft, client_ip: e.target.value })}
+              />
+              <Select
+                aria-label={t("logs.filter.profile")}
                 value={draft.profile}
-                onChange={(e) => setDraft({ ...draft, profile: e.target.value })}
+                onChange={(value) => setDraft({ ...draft, profile: value })}
               >
-                <option value="">全部产品</option>
+                <option value="">{t("logs.allProfiles")}</option>
                 {profiles.map((p) => (
                   <option key={p}>{p}</option>
                 ))}
-              </select>
-              <select
-                aria-label="筛选状态"
+              </Select>
+              <Select
+                aria-label={t("logs.filter.status")}
                 value={draft.status}
-                onChange={(e) => setDraft({ ...draft, status: e.target.value })}
+                onChange={(value) => setDraft({ ...draft, status: value })}
               >
-                <option value="">全部状态</option>
-                <option value="success">成功</option>
-                <option value="error">失败</option>
-                <option value="cancelled">取消</option>
-                <option value="429">HTTP 429</option>
-              </select>
+                <option value="">{t("logs.allStatuses")}</option>
+                <option value="success">{t("logs.outcome.success")}</option>
+                <option value="error">{t("logs.outcome.error")}</option>
+                <option value="cancelled">{t("logs.outcome.cancelled")}</option>
+                <option value="429">{t("logs.http429")}</option>
+              </Select>
             </>
           )}
-          <input
-            aria-label="搜索日志"
-            placeholder="搜索标识 / 操作…"
+          {kind === "credit" && (
+            <CreditFilters
+              credential={draft.credential}
+              type={draft.type}
+              names={names}
+              onChange={(patch) => setDraft({ ...draft, ...patch })}
+            />
+          )}
+          <SearchInput
+            aria-label={t("logs.filter.search")}
+            placeholder={t("logs.placeholder.search")}
             value={draft.search}
-            onChange={(e) => setDraft({ ...draft, search: e.target.value })}
+            onChange={(search) => setDraft({ ...draft, search })}
           />
-          <button type="submit">应用筛选</button>
+          <button type="submit">{t("logs.apply")}</button>
           <button
             type="button"
             onClick={() => {
@@ -191,13 +236,13 @@ export function Logs() {
               setCursors([]);
             }}
           >
-            重置
+            {t("logs.reset")}
           </button>
         </form>
         <ResourceState {...resource} />
         {resource.data?.degraded && (
           <div className={s.warning} role="alert">
-            日志读取已降级，列表可能不完整，请检查审计存储状态。
+            {t("logs.degraded")}
           </div>
         )}
         {resource.data &&
@@ -206,16 +251,28 @@ export function Logs() {
               <table>
                 <thead>
                   <tr>
-                    <th>时间 / ID</th>
-                    <th>{kind === "request" ? "模型 / 产品" : "操作 / 类型"}</th>
-                    <th>状态</th>
+                    <th>{t("logs.col.time")}</th>
+                    {kind === "credit" ? (
+                      <>
+                        <th>{t("logs.col.changeAccount")}</th>
+                        <th>{t("logs.col.changeAmount")}</th>
+                        <th>{t("logs.col.changeSource")}</th>
+                      </>
+                    ) : (
+                      <>
+                        <th>
+                          {kind === "request" ? t("logs.col.modelProfile") : t("logs.col.action")}
+                        </th>
+                        <th>{t("logs.col.status")}</th>
+                      </>
+                    )}
                     {kind === "request" && (
                       <>
-                        <th>耗时</th>
+                        <th>{t("logs.col.duration")}</th>
                         <th>Token / Credit</th>
                       </>
                     )}
-                    <th>操作</th>
+                    <th>{t("logs.col.actions")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -230,30 +287,55 @@ export function Logs() {
                             : text(item.started_at)}
                           <small className={s.mono}>{text(item.id)}</small>
                         </td>
-                        <td>
-                          <strong>{text(kind === "request" ? item.model : item.action)}</strong>
-                          <small>{text(kind === "request" ? item.profile : item.kind)}</small>
-                        </td>
-                        <td>
-                          <Badge
-                            tone={
-                              outcome === "success"
-                                ? "good"
-                                : outcome === "error"
-                                  ? "bad"
-                                  : outcome === "warning"
-                                    ? "warn"
-                                    : "neutral"
-                            }
-                          >
-                            {outcome === "warning"
-                              ? "警告"
-                              : text(outcome ?? item.level ?? item.status)}
-                          </Badge>
-                          {item.status_code !== undefined && (
-                            <small>HTTP {text(item.status_code)}</small>
-                          )}
-                        </td>
+                        {kind === "credit" ? (
+                          <CreditRow item={item} names={names} />
+                        ) : (
+                          <>
+                            <td>
+                              <strong title={kind === "request" ? undefined : text(item.action)}>
+                                {text(
+                                  kind === "request"
+                                    ? item.model
+                                    : eventActionLabel(item.action)
+                                      ? t(eventActionLabel(item.action)!)
+                                      : item.action,
+                                )}
+                              </strong>
+                              <small title={kind === "request" ? undefined : text(item.kind)}>
+                                {text(
+                                  kind === "request"
+                                    ? item.profile
+                                    : eventKindLabel(item.kind)
+                                      ? t(eventKindLabel(item.kind)!)
+                                      : item.kind,
+                                )}
+                              </small>
+                              {kind === "request" && item.client_ip ? (
+                                <small className={s.mono}>{text(item.client_ip)}</small>
+                              ) : null}
+                            </td>
+                            <td>
+                              <Badge
+                                tone={
+                                  outcome === "success"
+                                    ? "good"
+                                    : outcome === "error"
+                                      ? "bad"
+                                      : outcome === "warning"
+                                        ? "warn"
+                                        : "neutral"
+                                }
+                              >
+                                {(typeof outcome === "string"
+                                  ? t(outcomeLabels[outcome])
+                                  : undefined) ?? text(outcome ?? item.level ?? item.status)}
+                              </Badge>
+                              {item.status_code !== undefined && (
+                                <small>HTTP {text(item.status_code)}</small>
+                              )}
+                            </td>
+                          </>
+                        )}
                         {kind === "request" && (
                           <>
                             <td>{metric(item.duration_ms)} ms</td>
@@ -265,7 +347,7 @@ export function Logs() {
                         )}
                         <td>
                           <button disabled={detailLoading} onClick={() => openDetail(item)}>
-                            查看详情
+                            {t("logs.viewDetail")}
                           </button>
                         </td>
                       </tr>
@@ -275,7 +357,7 @@ export function Logs() {
               </table>
             </div>
           ) : (
-            <Empty title="没有匹配的日志">请尝试调整筛选。</Empty>
+            <Empty title={t("logs.noMatch")}>{t("logs.adjustFilters")}</Empty>
           ))}
         <div className={s.pagination}>
           <span>第 {cursors.length + 1} 页</span>
@@ -284,7 +366,7 @@ export function Logs() {
               disabled={!cursors.length || resource.loading}
               onClick={() => setCursors((old) => old.slice(0, -1))}
             >
-              上一页
+              {t("logs.prevPage")}
             </button>
             <button
               disabled={!resource.data?.has_more || resource.loading}
@@ -293,17 +375,17 @@ export function Logs() {
                   setCursors((old) => [...old, resource.data!.next_cursor!]);
               }}
             >
-              下一页
+              {t("logs.nextPage")}
             </button>
           </div>
         </div>
       </Panel>
       <DrawerPresence>
         {detail && (
-          <Drawer title="日志详情与实际尝试" onClose={closeDetail}>
+          <Drawer title={t("logs.detailTitle")} onClose={closeDetail}>
             <ErrorNotice message={detailError} />
             {detailLoading ? (
-              <p role="status">正在加载详情…</p>
+              <p role="status">{t("logs.detailLoading")}</p>
             ) : (
               <>
                 <Fields
@@ -312,16 +394,16 @@ export function Logs() {
                   )}
                 />
                 {Array.isArray(detail.attempts) && (
-                  <Panel title="实际尝试">
+                  <Panel title={t("logs.attempts")}>
                     {detail.attempts.length ? (
                       list(detail.attempts).map((attempt, i) => (
                         <div key={i}>
-                          <h3>尝试 {i + 1}</h3>
+                          <h3>{t("logs.attemptN", { n: i + 1 })}</h3>
                           <Fields data={attempt} />
                         </div>
                       ))
                     ) : (
-                      <p>暂无尝试记录。</p>
+                      <p>{t("logs.noAttempts")}</p>
                     )}
                   </Panel>
                 )}

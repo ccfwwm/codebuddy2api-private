@@ -23,6 +23,13 @@ DOMAIN_PROFILES = {
     "www.codebuddy.ai": "intl-cli",
     "www.workbuddy.ai": "intl-work",
 }
+# Credential domain stored for each product; refresh echoes X-Domain back as auth.domain.
+PROFILE_DOMAINS = {
+    "cn-cli": "www.codebuddy.cn",
+    "cn-work": "www.workbuddy.cn",
+    "intl-cli": "www.codebuddy.ai",
+    "intl-work": "www.workbuddy.ai",
+}
 # Verified CLI and WorkBuddy packages share these relative authentication paths.
 _REFRESH_PATH = "/v2/plugin/auth/token/refresh"
 
@@ -134,6 +141,10 @@ def profile_for_headers(headers: dict) -> str:
 
 def chat_url_for_headers(headers: dict) -> str:
     return PROFILE_ENDPOINTS[profile_for_headers(headers)] + "/v2/chat/completions"
+
+
+def search_url_for_headers(headers: dict) -> str:
+    return PROFILE_ENDPOINTS[profile_for_headers(headers)] + "/agenttool/v1/search"
 
 
 def refresh_url_for_auth(auth: dict) -> str:

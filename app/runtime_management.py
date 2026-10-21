@@ -8,12 +8,14 @@ from pathlib import Path
 from . import buddy
 from .admin_api import install_admin
 from .audit_store import AuditStore
+from .backups import Backups
 from .control_store import ControlStore
 from .gateway_management import Management, install_pages
 from .inference_auth import InferenceAuthMiddleware
 from .model_policy import PolicyScopeMiddleware
 from .observability import AuditMiddleware
 from .settings import SCHEMA, apply_persisted_settings
+from .updates import Updater
 
 
 class UnavailableAudit:
@@ -103,6 +105,9 @@ def initialize(gateway, args, argv=None, *, parser=None, dotenv_keys=()):
         config["audit_store"] = UnavailableAudit(type(error).__name__)
         print("[audit] 日志库不可用，推理服务继续；请检查目录权限或使用备份恢复日志库。", file=sys.stderr)
     config["management"] = Management(gateway)
+    config["backups"] = Backups(config, data_dir=root, version=gateway.APP_VERSION)
+    config["updater"] = Updater(config, root=Path(gateway.__file__).resolve().parent,
+                                data_dir=root, version=gateway.APP_VERSION, backups=config["backups"])
     return config["management"]
 
 

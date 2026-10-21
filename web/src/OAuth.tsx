@@ -3,6 +3,7 @@ import { api, errorMessage, number, object, text } from "./api";
 import { Drawer, ErrorNotice, Icon } from "./components";
 import { useExiting } from "./presence";
 import s from "./ui.module.scss";
+import { Select } from "./fields";
 
 export function safeOAuthUrl(value: unknown): string {
   if (typeof value !== "string") throw new Error("OAuth 响应缺少验证链接");
@@ -86,11 +87,11 @@ export function OAuth({ onClose, onDone }: { onClose: () => void; onDone: () => 
       </p>
       <label className={s.field}>
         登录站点
-        <select value={site} disabled={!!login || busy} onChange={(e) => setSite(e.target.value)}>
+        <Select value={site} disabled={!!login || busy} onChange={(value) => setSite(value)}>
           <option value="cn">中国大陆 · CN</option>
           <option value="intl">国际 · WorkBuddy</option>
           <option value="intl-codebuddy">国际 · CodeBuddy</option>
-        </select>
+        </Select>
       </label>
       <ErrorNotice message={error} />
       <p className={s.oauthStatus} role="status">

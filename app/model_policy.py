@@ -3,6 +3,7 @@ from contextvars import ContextVar
 
 from fastapi import HTTPException
 
+from app import growth_tasks, perf_metrics, travel
 from app.model_capabilities import route_metadata
 _request_policy = ContextVar("gateway_model_policy", default=None)
 
@@ -22,23 +23,89 @@ class PolicyScopeMiddleware:
 
 
 def snapshot(config):
+    """Return a detached policy snapshot; one routing decision resolves it exactly once."""
     store = config.get("control_store")
-    return store.snapshot() if store is not None else {"models": {}, "credentials": {}, "revision": 0}
+    if store is None:
+        return {"models": {}, "credentials": {}, "revision": 0}
+    perf_metrics.inc("policy_snapshot_calls")
+    return store.snapshot()
 
 
-def credential_enabled(config, entry):
-    return snapshot(config)["credentials"].get(entry.get("account_key"), {}).get("enabled", True)
+class PolicyView:
+    """One published policy revision reused across a whole routing decision."""
+
+    __slots__ = ("data",)
+
+    def __init__(self, data):
+        self.data = data
+
+    @property
+    def revision(self):
+        return self.data.get("revision", 0)
+
+    def credential(self, entry):
+        """Return the account metadata block for this entry, or an empty mapping."""
+        return (self.data.get("credentials") or {}).get(entry.get("account_key")) or {}
+
+    def rule_for(self, source):
+        return {**default_rule(source), **(self.data.get("models") or {}).get(source, {})}
 
 
-def credential_auto_checkin(config, entry):
+def view(config):
+    """Resolve the policy once so every candidate check in one request sees the same revision."""
+    return PolicyView(snapshot(config))
+
+
+def revision(config, policy=None):
+    """Return the published revision without copying the snapshot."""
+    if policy is not None:
+        return policy.revision
+    store = config.get("control_store")
+    if store is None:
+        return 0
+    value = getattr(store, "revision", None)
+    return value if isinstance(value, int) else snapshot(config).get("revision", 0)
+
+
+def _policy(config, policy=None):
+    return policy.data if policy is not None else snapshot(config)
+
+
+def credential_enabled(config, entry, policy=None):
+    return _policy(config, policy)["credentials"].get(entry.get("account_key"), {}).get("enabled", True)
+
+
+def credential_auto_checkin(config, entry, policy=None):
     """International accounts opt in explicitly; the preference is independent of routing."""
     default = entry.get("profile") in {"cn-cli", "cn-work"}
-    return snapshot(config)["credentials"].get(entry.get("account_key"), {}).get("auto_checkin", default)
+    return _policy(config, policy)["credentials"].get(entry.get("account_key"), {}).get("auto_checkin", default)
 
 
-def credential_auto_travel(config, entry):
-    supported = entry.get("profile") in {"cn-cli", "cn-work"}
-    return supported and snapshot(config)["credentials"].get(entry.get("account_key"), {}).get("auto_travel", True)
+def credential_auto_travel(config, entry, policy=None):
+    # The growth center is personal-only, so an enterprise tenant must never be scheduled
+    # for travel even though it shares the domestic product profile.
+    supported = travel.supported(entry.get("profile"), entry.get("enterprise") is True)
+    return supported and _policy(config, policy)["credentials"].get(entry.get("account_key"), {}).get("auto_travel", True)
+
+
+def credential_auto_daily_chat(config, entry, policy=None):
+    """A turn spends credits on the account, so international accounts opt in explicitly."""
+    supported = entry.get("profile") == "intl-work"
+    return supported and _policy(config, policy)["credentials"].get(entry.get("account_key"), {}).get("auto_daily_chat", False)
+
+
+def credential_auto_growth(config, entry, policy=None):
+    """Growth-center sweep is pure accept/claim, so it defaults on for eligible accounts."""
+    return growth_tasks.supported(entry.get("profile"), entry.get("enterprise") is True) and \
+        _policy(config, policy)["credentials"].get(entry.get("account_key"), {}).get("auto_growth", True)
+
+
+def growth_auto_tasks(config, entry, policy=None):
+    """Task codes whose automation chains the sweep may drive for this account."""
+    if not credential_auto_growth(config, entry, policy):
+        return frozenset()
+    mapping = _policy(config, policy)["credentials"].get(entry.get("account_key"), {}).get("growth_auto") or {}
+    return frozenset(code for code, enabled in mapping.items() if enabled is True)
 
 
 def default_rule(source):
@@ -47,8 +114,8 @@ def default_rule(source):
             "region": None, "profile": None, "credential_ids": []}
 
 
-def rule_for(config, source):
-    return {**default_rule(source), **snapshot(config)["models"].get(source, {})}
+def rule_for(config, source, policy=None):
+    return {**default_rule(source), **_policy(config, policy)["models"].get(source, {})}
 
 
 def _deny(message, code="model_disabled"):
@@ -56,11 +123,18 @@ def _deny(message, code="model_disabled"):
         "message": message, "type": "invalid_request_error", "param": "model", "code": code}})
 
 
-def _active(config, upstream):
+def _active(config, upstream, policy=None):
     state = _request_policy.get()
     if state and state.get("upstream") == upstream:
-        return rule_for(config, state["source"]), state
-    return rule_for(config, upstream), None
+        return rule_for(config, state["source"], policy), state
+    return rule_for(config, upstream, policy), None
+
+
+def active_rule(config, model, policy=None):
+    """Return the rule governing this request's model, including a request-scoped alias."""
+    if not model:
+        return default_rule("")
+    return _active(config, model, policy)[0]
 
 
 def resolve(config, public_model):
@@ -96,11 +170,11 @@ def check_resolved(config, upstream):
         _deny("模型已停用")
 
 
-def route_allowed(config, entry, model, *, rule=None):
-    if not credential_enabled(config, entry):
+def route_allowed(config, entry, model, *, rule=None, policy=None):
+    if not credential_enabled(config, entry, policy):
         return False
     if rule is None:
-        active, state = _active(config, model) if model else (default_rule(""), None)
+        active, state = _active(config, model, policy) if model else (default_rule(""), None)
         if state and state["rule"] != active:
             return False
         rule = active
@@ -153,17 +227,21 @@ def public_details(gateway, region=None):
             _request_policy.reset(token)
         if pool is not None and not candidates:
             continue
-        prices = {}
+        prices, measured = {}, set()
         accounts = config.get("account_catalogs")
         if accounts is not None:
             for entry in candidates:
                 profile = entry.get("profile")
-                for model in gateway._effective_account_scope(
+                for model in gateway._published_account_scope(
                         accounts.get(entry.get("account_key")) or {}, "serves", model_id=gateway._upstream_model(upstream, profile)) or []:
                     if model.get("id") == gateway._upstream_model(upstream, profile):
                         price = gateway._multiplier_value(model.get("credits"))
-                        if price is not None:
-                            prices[profile] = min(prices.get(profile, price), price)
+                        if price is not None and price <= prices.get(profile, price):
+                            prices[profile] = price
+                            if model.get("credits_source") == "measured":
+                                measured.add(profile)
+                            else:
+                                measured.discard(profile)
         else:
             allowed_profiles = {entry.get("profile") for entry in candidates}
             prices = {profile: price for profile, price in item["credits_by_profile"].items()
@@ -175,7 +253,10 @@ def public_details(gateway, region=None):
             # A later catalog refresh must not overwrite an explicitly configured alias.
             if name in owners and owners[name] != source:
                 continue
-            out.append({"id": name, "credits": min(prices.values(), default=None),
-                        "credits_by_profile": prices,
-                        **route_metadata(gateway, upstream, entries=candidates, rule=rule, region=region)})
+            best = min(prices.values(), default=None)
+            row = {"id": name, "credits": best, "credits_by_profile": prices,
+                   **route_metadata(gateway, upstream, entries=candidates, rule=rule, region=region)}
+            if any(prices[profile] == best for profile in measured):
+                row["credits_estimated"] = True   # Upstream declares it free but charges it.
+            out.append(row)
     return out

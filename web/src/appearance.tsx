@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { create } from "zustand";
+import { api, object } from "./api";
 import { Drawer, DrawerPresence, Icon } from "./components";
+import { chooseLanguage, languagePreference, useT, type LangPref } from "./i18n";
 import s from "./ui.module.scss";
 import "./theme.scss";
 
@@ -64,6 +66,46 @@ export function chooseAppearance(value: Partial<{ mode: Mode; palette: Palette }
     persisted = false;
   }
   useAppearance.setState({ ...next, persisted });
+}
+const LANGUAGE_CYCLE: LangPref[] = ["system", "zh", "en"];
+/** Save through the API as well, so the CLI and other browsers share the choice. */
+function persistLanguage(value: LangPref) {
+  void api
+    .get<unknown>("/settings")
+    .then((response) =>
+      api.patch("/settings", {
+        values: { language: value === "system" ? "auto" : value },
+        revision: object(response.data).revision,
+      }),
+    )
+    .catch(() => undefined);
+}
+/** One click moves to the next interface language: system, Chinese, English. */
+export function LanguageToggle() {
+  const t = useT();
+  const [pref, setPref] = useState(languagePreference);
+  const name = { system: t("appearance.lang.system"), zh: "中文", en: "English" }[pref];
+  const label = t("appearance.languageIs", { lang: name });
+  return (
+    <button
+      type="button"
+      className={s.appearanceButton}
+      aria-label={label}
+      title={label}
+      onClick={() => {
+        const next = LANGUAGE_CYCLE[(LANGUAGE_CYCLE.indexOf(pref) + 1) % LANGUAGE_CYCLE.length]!;
+        chooseLanguage(next);
+        setPref(next);
+        persistLanguage(next);
+      }}
+    >
+      {pref === "system" ? (
+        <Icon name="globe" />
+      ) : (
+        <span className={s.langGlyph}>{pref === "zh" ? "中" : "EN"}</span>
+      )}
+    </button>
+  );
 }
 export function Appearance() {
   const [open, setOpen] = useState(false);

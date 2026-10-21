@@ -13,7 +13,8 @@ import uuid
 
 import httpx
 
-from .site_routing import profile_for_auth
+from .client_profiles import canonical_uid, refresh_headers
+from .site_routing import PROFILE_DOMAINS, PROFILE_ENDPOINTS, profile_for_auth, refresh_url_for_auth
 
 PLUGIN_PREFIX = "/v2/plugin"
 OAUTH_TIMEOUT_S = 600          # Authorization deadline in seconds
@@ -61,6 +62,88 @@ def _token_issuer_origin(access_token: str) -> str:
         return ""
 
 
+def token_uid(token) -> str:
+    """Read the account uid from a JWT subject, returning an empty string on failure."""
+    if not isinstance(token, str) or token.count(".") != 2:
+        return ""
+    part = token.split(".")[1]
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+    except Exception:
+        return ""
+    sub = claims.get("sub") if isinstance(claims, dict) else None
+    return sub.strip() if isinstance(sub, str) else ""
+
+
+def refresh_tokens(refresh_token, profile, *, uid="") -> dict:
+    """Exchange a refresh token for a full token payload without an existing credential file.
+
+    The endpoint is an explicit choice: a domestic issuer cannot tell the CLI and
+    WorkBuddy products apart, and a cross-region endpoint rejects the token.
+    """
+    if not isinstance(refresh_token, str) or not refresh_token.strip():
+        raise ValueError("刷新令牌为空")
+    if profile not in PROFILE_DOMAINS:
+        raise ValueError("未知的凭证端点")
+    token = refresh_token.strip()
+    account_uid = str(uid or token_uid(token) or "")
+    domain = PROFILE_DOMAINS[profile]
+    headers = refresh_headers(domain, account_uid)
+    headers["X-Refresh-Token"] = token
+    headers["X-Auth-Refresh-Source"] = "plugin"
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT_S) as client:
+            response = client.post(refresh_url_for_auth({"domain": domain}), headers=headers, json={})
+    except httpx.HTTPError as error:
+        raise RuntimeError(f"刷新令牌网络失败: {type(error).__name__}") from None
+    if response.status_code != 200:
+        raise RuntimeError(f"刷新令牌被拒绝（HTTP {response.status_code}）")
+    try:
+        data = response.json()
+    except ValueError:
+        raise RuntimeError("刷新令牌返回无法解析") from None
+    payload = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or data.get("code") != 0 or not isinstance(payload, dict):
+        raise RuntimeError("刷新令牌已失效或端点不匹配")
+    if not isinstance(payload.get("accessToken"), str) or not payload["accessToken"]:
+        raise RuntimeError("刷新令牌未返回有效的 accessToken")
+    if not isinstance(payload.get("refreshToken"), str) or not payload["refreshToken"]:
+        raise RuntimeError("刷新令牌未返回新的 refreshToken")
+    tokens = dict(payload)
+    tokens["domain"] = domain  # Pin the selected product; the response only echoes X-Domain back.
+    return tokens
+
+
+def fetch_account(access_token, domain) -> dict:
+    """Read the official account block for a token, including any tenant id.
+
+    Refresh-token imports have no account payload, and an enterprise credential stored
+    with only a uid would bill through the personal endpoint and look empty.
+    """
+    if not isinstance(access_token, str) or not access_token:
+        raise ValueError("缺少有效的 accessToken")
+    profile = profile_for_auth({"domain": domain})
+    headers = refresh_headers(domain, "")
+    headers["Authorization"] = f"Bearer {access_token}"
+    url = PROFILE_ENDPOINTS[profile] + PLUGIN_PREFIX + "/login/account"
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT_S) as client:
+            response = client.get(url, headers=headers)
+    except httpx.HTTPError as error:
+        raise RuntimeError(f"账号信息网络失败: {type(error).__name__}") from None
+    if response.status_code != 200:
+        raise RuntimeError(f"账号信息被拒绝（HTTP {response.status_code}）")
+    try:
+        data = response.json()
+    except ValueError:
+        raise RuntimeError("账号信息返回无法解析") from None
+    account = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or data.get("code") != 0 or not isinstance(account, dict):
+        raise RuntimeError("账号信息读取失败")
+    if not isinstance(account.get("uid"), str) or not account["uid"]:
+        raise RuntimeError("账号信息缺少 uid")
+    return account
+
 def _reject_constant(value):
     raise ValueError(f"非标准 JSON 常量: {value}")
 
@@ -70,21 +153,44 @@ def loads_strict(text):
     return json.loads(text, parse_constant=_reject_constant)
 
 
+class AuthTokenTypeError(ValueError):
+    """A credential token field is not a plaintext string (e.g. an encrypted envelope)."""
+
+
+def ensure_plaintext_tokens(auth: dict) -> None:
+    """Reject non-string token fields so encrypted envelope objects never reach upstream headers."""
+    for field in ("accessToken", "refreshToken"):
+        value = auth.get(field)
+        if value is not None and not isinstance(value, str):
+            raise AuthTokenTypeError(
+                f"auth.{field} 不是明文字符串（可能为加密信封格式），请改用 OAuth 登录获取明文凭据")
+
 def validate_cred_data(data) -> tuple[str | None, str | None]:
     """Validate credentials and return either the account UID or a safe failure reason."""
     if not isinstance(data, dict):
         return None, "凭据不是有效的 JSON 对象"
     acct = data.get("account")
-    if not isinstance(acct, dict):
+    if not isinstance(acct, dict) or not acct:
+        # An empty ``account`` object must not hide a populated ``accounts[0]``.
         arr = data.get("accounts")
-        acct = arr[0] if isinstance(arr, list) and arr and isinstance(arr[0], dict) else None
+        candidate = arr[0] if isinstance(arr, list) and arr and isinstance(arr[0], dict) else None
+        acct = candidate if candidate else (acct if isinstance(acct, dict) else None)
     uid = str((acct or {}).get("uid") or "")
+    if not uid:
+        # A uid-less credential with a real email is still identifiable; the same
+        # canonical fallback is used by the identity hash so both agree.
+        uid = canonical_uid(acct)
     if not uid:
         return None, "缺少 account.uid"
     auth = data.get("auth") if isinstance(data.get("auth"), dict) else {}
     token = auth.get("accessToken") or auth.get("access_token") or auth.get("token")
     if not isinstance(token, str) or not token:
         return None, "缺少有效的 accessToken"
+    # Envelope objects must be rejected before persistence, including token aliases.
+    for field in ("accessToken", "access_token", "token", "refreshToken", "refresh_token"):
+        value = auth.get(field)
+        if value is not None and not isinstance(value, str):
+            return None, f"{field} 不是明文字符串（可能为加密信封格式）"
     for field in ("expiresAt", "lastRefreshTime"):
         value = auth.get(field)
         if value is None:

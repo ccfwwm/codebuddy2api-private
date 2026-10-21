@@ -243,7 +243,7 @@ class EndpointTests(unittest.TestCase):
                 converter.CONFIG["tool_call_max_retry"] = 3
 
     def test_credential_selection_runs_off_the_event_loop(self):
-        """Offload blocking credential routing to the thread pool for all protocols."""
+        """Offload blocking Responses projection and credential routing."""
         import inspect
         import re
         src = inspect.getsource(converter)
@@ -252,6 +252,7 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(direct, [])
         # All initial and failover routing must run outside the event-loop thread.
         self.assertGreaterEqual(len(pooled), 3)
+        self.assertRegex(src, r"await run_in_threadpool\(\s*project_responses_chat_body")
 
     def test_tool_metadata_policy_reaches_all_protocols(self):
         description = "Read sandbox data without destructive changes."
@@ -274,7 +275,7 @@ class EndpointTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(len(self.requests), 1)
                 sent = json.loads(self.requests[0].content)["tools"][0]["function"]
-                retained = keep or (not desensitize and route != "/v1/responses")
+                retained = keep or not desensitize
                 self.assertEqual("description" in sent, retained)
                 self.assertEqual("title" in sent["parameters"], retained)
                 prop = sent["parameters"]["properties"]["path"]
@@ -382,6 +383,25 @@ class EndpointTests(unittest.TestCase):
         with self.assertRaises(converter.HTTPException) as caught:
             converter._guard_request_size(body)
         self.assertEqual(caught.exception.status_code, 413)
+
+    def test_request_byte_budget_excludes_only_top_level_local_metadata(self):
+        public = {"messages": [{"role": "user", "content": "汉字"}],
+                  "tools": [{"type": "function", "function": {"name": "echo", "parameters": {
+                      "type": "object", "properties": {"_tool_registry": {"type": "string", "default": "汉字" * 200}}}}}]}
+        registry = {"internal": "x" * 10000}
+        local_policy = object()
+        body = {**public, "_tool_registry": registry, "_runtime_note": object(),
+                converter._REQUEST_POLICY_KEY: local_policy}
+        size = len(json.dumps(public, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+        converter.CONFIG["max_request_bytes"] = size
+        self.assertEqual(converter._guard_request_size(body), size)
+        self.assertIs(body["_tool_registry"], registry)
+        self.assertIs(body[converter._REQUEST_POLICY_KEY], local_policy)
+        converter.CONFIG["max_request_bytes"] = size - 1
+        with self.assertRaises(converter.HTTPException) as caught:
+            converter._guard_request_size(body)
+        self.assertEqual(caught.exception.status_code, 413)
+
 
     def test_bad_payloads_and_auth_fail_without_upstream(self):
         for route in ROUTES:
@@ -800,7 +820,7 @@ class StartupUsageHydrationTests(unittest.TestCase):
         return path
 
     def test_main_publishes_cached_usage_before_serving(self):
-        """The aggregate must be populated by the time uvicorn.run is entered."""
+        """The aggregate must be populated by the time the server is started."""
         path = self.credential()
         # Preseed the cache for the identity this credential will resolve to.
         probe = converter.CredentialPool([path], blocks_path=self.root / "blocks.json")
@@ -826,7 +846,7 @@ class StartupUsageHydrationTests(unittest.TestCase):
                 # Inspect the aggregate at the moment the server would start serving.
                 observed["usage"] = converter.CONFIG.get("usage_daily")
                 observed["accounts"] = converter.CONFIG.get("usage_daily_accounts")
-            stack.enter_context(patch.object(converter.uvicorn, "run", side_effect=capture))
+            stack.enter_context(patch.object(converter, "run_server", side_effect=capture))
             converter.main()
 
         self.assertIsNotNone(observed["usage"], "main() never published usage")
@@ -849,7 +869,7 @@ class StartupUsageHydrationTests(unittest.TestCase):
             stack.enter_context(patch.object(converter, "seed_credentials"))
             stack.enter_context(patch.object(converter, "preflight", return_value=True))
             stack.enter_context(patch.object(runtime_management, "install"))
-            stack.enter_context(patch.object(converter.uvicorn, "run",
+            stack.enter_context(patch.object(converter, "run_server",
                                             side_effect=lambda *a, **k: observed.setdefault("usage",
                                                                                             converter.CONFIG.get("usage_daily"))))
             converter.main()
@@ -880,7 +900,7 @@ class StartupUsageHydrationTests(unittest.TestCase):
                 events.append(("thread", converter.CONFIG.get("usage_daily") is not None))
                 return Mock()
             stack.enter_context(patch.object(converter.threading, "Thread", side_effect=note_thread))
-            stack.enter_context(patch.object(converter.uvicorn, "run"))
+            stack.enter_context(patch.object(converter, "run_server"))
             converter.main()
         # Every thread must have been started after usage was published.
         self.assertTrue(events)
@@ -909,7 +929,7 @@ class ConfigurationTests(unittest.TestCase):
             stack.enter_context(patch.object(converter, "CredentialPool", return_value=Mock(first=lambda: None)))
             stack.enter_context(patch.object(converter, "credits_mod", None))
             stack.enter_context(patch.object(converter.threading, "Thread"))
-            server = stack.enter_context(patch.object(converter.uvicorn, "run"))
+            server = stack.enter_context(patch.object(converter, "run_server"))
             from app import runtime_management
             close = stack.enter_context(patch.object(runtime_management, "close", wraps=runtime_management.close))
             if invalid:
@@ -927,12 +947,15 @@ class ConfigurationTests(unittest.TestCase):
                 self.assertEqual(server.call_args.kwargs["host"], expected_host)
             return {key: converter.CONFIG[key] for key in (
                 "max_images", "image_policy", "max_request_bytes", "log_body_limit", "admin_csrf",
-                "keep_tool_metadata", "admin_allowed_origins")}
+                "keep_tool_metadata", "admin_allowed_origins", "responses_projection_mode",
+                "responses_projection_max_bytes")}
 
     def test_defaults(self):
-        self.assertEqual(self.configure(), {"max_images": 16, "image_policy": "truncate",
-                                           "max_request_bytes": 33554432, "log_body_limit": 65536,
-                                           "admin_csrf": True, "keep_tool_metadata": False, "admin_allowed_origins": ""})
+        self.assertEqual(self.configure(), {
+            "max_images": 16, "image_policy": "truncate", "max_request_bytes": 33554432,
+            "log_body_limit": 65536, "admin_csrf": True, "keep_tool_metadata": False,
+            "admin_allowed_origins": "", "responses_projection_mode": "balanced",
+            "responses_projection_max_bytes": 40000})
 
     def test_open_binding_without_key_requires_explicit_opt_in(self):
         # Reject unauthenticated public binding by default.
@@ -958,9 +981,11 @@ class ConfigurationTests(unittest.TestCase):
     def test_environment_and_explicit_cli_precedence(self):
         env = {"CODEBUDDY2API_MAX_IMAGES": "8", "CODEBUDDY2API_IMAGE_POLICY": "error",
                "CODEBUDDY2API_MAX_REQUEST_BYTES": "100000", "CODEBUDDY2API_LOG_BODY_LIMIT": "0"}
-        self.assertEqual(self.configure(env), {"max_images": 8, "image_policy": "error",
-                                               "max_request_bytes": 100000, "log_body_limit": 0,
-                                               "admin_csrf": True, "keep_tool_metadata": False, "admin_allowed_origins": ""})
+        self.assertEqual(self.configure(env), {
+            "max_images": 8, "image_policy": "error", "max_request_bytes": 100000,
+            "log_body_limit": 0, "admin_csrf": True, "keep_tool_metadata": False,
+            "admin_allowed_origins": "", "responses_projection_mode": "balanced",
+            "responses_projection_max_bytes": 40000})
         env["CODEBUDDY2API_IMAGE_POLICY"] = "invalid-overridden"
         self.assertEqual(self.configure(env, ("--max-images", "0", "--image-policy", "truncate"))["max_images"], 0)
 

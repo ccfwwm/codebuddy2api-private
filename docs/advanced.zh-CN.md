@@ -8,7 +8,11 @@
 
 配置优先级：**显式 CLI 参数 > 进程环境变量 > `.env` > SQLite 保存值 > 默认值**。热更新设置立即生效，标记为重启的项需手动重启；锁定项请在对应来源修改，WebUI 不改写 `.env` 或返回 API key 明文。
 
-Compose 会显式传入部分环境变量及 CLI 参数，删除 `.env` 中的一行不一定解除锁定。修改这些值后重建容器；若要由 WebUI 接管，还需取消 Compose 中对应的显式设置。
+Compose 会加载 `.env` 中的每个键，注释掉一行即可解除锁定；只有 `CODEBUDDY_AUTH_DIR` 和 `CODEBUDDY2API_ALLOW_OPEN_NOAUTH` 由 Compose 文件固定。修改这些值后重建容器。
+
+`.env` 里的运行参数在 WebUI 中始终只读，直到被搬进配置库：停止服务后执行 `python3 converter.py config migrate`（见[配置迁移](deployment.zh-CN.md#配置迁移)）。Dashboard 会显示一次性横幅列出这些键；迁移或点击“不再提醒”都会在配置库写入 `config_notice_muted` 并停止提示，之后新增的 `.env` 运行参数也不再提醒。
+
+`language`（`auto|zh|en`）是 WebUI 与 CLI 共用的唯一界面偏好：没有环境变量映射，也永不被锁定。`--lang` 会在 `serve`、`login`、`config migrate` 时写入该值；`config status` 只读，仅影响本次输出。
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -30,6 +34,8 @@ Compose 会显式传入部分环境变量及 CLI 参数，删除 `.env` 中的�
 | `--model-capability-guard [true/false]` | `true` | 预检模型声明的图片、工具、思考及已映射输出上限；新请求生效 |
 | `--max-images` | `16` | 单请求图片总数；`0` 不允许图片 |
 | `--image-policy` | `truncate` | 保留最新图片；设为 `error` 时超限返回 413 |
+| `--responses-projection-mode balanced\|passthrough` | `balanced` | 仅改写有固定摘要的已识别 harness；passthrough 完全关闭 Responses 投影 |
+| `--responses-projection-max-bytes` | `40000` | assistant、完整工具参数 JSON 与工具结果的单项 UTF-8 字节上限；`0` 禁用，`256..33554432` 为有效范围 |
 | `--tool-call-max-retry` | `3` | 工具参数损坏时的额外生成上限（每次都消耗额度）；`0` 不重试 |
 | `--max-inbound-bytes` | `67108864` | 生成及 token 估算 POST 的解析前原始字节上限（含 chunked），超限 413；其他路由不缓冲请求体 |
 | `--max-collect-bytes` | `8388608` | 聚合及实时校验所需保留输出的总字节上限（正文+思考+工具参数/元数据），超限返回 `response_too_large`；`0` 不限制 |
@@ -40,27 +46,37 @@ Compose 会显式传入部分环境变量及 CLI 参数，删除 `.env` 中的�
 | `--request-context-mode` | `legacy` | `scoped` 启用显式会话与逐尝试追踪；变更只影响新请求 |
 | `--failover-max` | `0` | 请求在「一个字节都还没发给下游」之前失败时，最多再换几个凭证就地重放；`0` 表示如实把失败回给下游 |
 | `--retry-write-timeout` | `false` | 让「写请求体超时」也参与重放（换新连接与 `--failover-max` 换凭证），代价是已发出的那半截正文可能已被上游处理 |
-| `--max-request-bytes` | `33554432` | 处理后的上游 JSON 字节上限，须为正整数 |
+| `--max-request-bytes` | `33554432` | 处理后的上游 JSON 字节上限，不含网关内部元数据，须为正整数 |
 | `--log-body-limit` | `65536` | 旧文本预览兼容项；文本输出已停用，SQLite 诊断使用独立预算 |
 
-环境变量包括 `CODEBUDDY_AUTH_DIR`、`CODEBUDDY_IMPORT_DIR`、`CODEBUDDY2API_KEY`、`CODEBUDDY2API_ADMIN_CSRF`、`CODEBUDDY2API_ADMIN_ORIGINS`、`CODEBUDDY2API_KEEP_TOOL_METADATA`、`CODEBUDDY2API_STREAM_MODE`、`CODEBUDDY2API_LOG`，以及 `CODEBUDDY2API_MAX_IMAGES`、`CODEBUDDY2API_IMAGE_POLICY`、`CODEBUDDY2API_MAX_REQUEST_BYTES`、`CODEBUDDY2API_LOG_BODY_LIMIT`、`CODEBUDDY2API_FAILOVER_MAX`、`CODEBUDDY2API_RETRY_WRITE_TIMEOUT`。启动示例见[部署指南](deployment.zh-CN.md)。
+全部生效的环境变量及默认值见 `.env.example`；启动示例见[部署指南](deployment.zh-CN.md)。
+
+### Responses 投影
+
+通过 WebUI、CLI、环境变量或 `.env` 配置这两项热更新设置。优先级为 CLI > 进程环境变量 > `.env` > SQLite 保存值 > 默认值；CLI/环境变量会锁定 WebUI 字段。Compose 整体加载 `.env`，注释掉对应行即保持 WebUI 可编辑。
+
+`responses_projection_mode` 默认为 `balanced`，仅接受 `balanced` 和 `passthrough`。balanced 仅改写有固定摘要的已识别 harness；这些块之外的文本不计入预算、不会被裁剪。它还会按 `responses_projection_max_bytes` 对 assistant 内容、完整工具参数 JSON 和工具结果采用 Codex 风格头尾截断；文本标记显示原始 bytes、估算 tokens 与总行数。超限工具参数仍是有效 JSON，并以有界对象保留原始头尾和大小元数据。passthrough 完全关闭 Responses 投影。
+
+`responses_projection_max_bytes` 默认 `40000`，有效范围为 `0` 或 `256..33554432`。`0` 只禁用单项裁剪，仍受全局入站/请求与输出门禁约束。两项设置均不改变客户端 Base URL。
+
+降级到不含这些键的旧源码时，需按[流式模式](#流式模式)所述离线删除 `settings.responses_projection_mode` 与 `settings.responses_projection_max_bytes`。
 
 ### 工具元数据保留
 
-默认关闭，沿用旧策略：启用脱敏会剥离工具描述，Responses 的工具投影也会剥离描述；`--no-compact` 不改变这一行为。开启后，Chat、Responses、Messages 保留已支持工具定义中的描述及参数 schema 的字符串 `description/title`。若启用脱敏，保留的文本仍会处理；提示词压缩、现有审核兜底条件与重试次数不变，兜底也遵守本开关。
+Responses 投影不再修改工具定义或 schema。启用脱敏时，默认剥离工具描述及参数 schema 的字符串 `description/title`；开启本开关后，Chat、Responses、Messages 会保留并按脱敏规则处理这些文本。`--no-compact` 不改变本开关。
 
 - **WebUI**：系统设置 → 保留工具描述，未被启动来源锁定时可立即生效并持久化。
 - **CLI**：在原启动命令追加 `--keep-tool-metadata` 或 `--keep-tool-metadata true`；显式 `false` 可覆盖环境变量。
-- **环境变量**：设置 `CODEBUDDY2API_KEEP_TOOL_METADATA=true`；Compose 会传入已设置的值，未设置时不锁定 WebUI。删除或注释变量可解除环境锁定，不要设为空串。
+- **环境变量**：在 `.env` 中设置 `CODEBUDDY2API_KEEP_TOOL_METADATA=true`；注释掉该行即解除锁定，不要设为空串。
 
-需使用包含此功能的源码/镜像和 Compose 配置；修改容器环境后重新创建容器。保留描述可能增加输入 token 和审核拦截风险，不保证所有账号/模型都同样兼容；设为 `false` 可恢复旧策略。此开关不恢复 Responses 原有投影裁掉的其他 schema 字段或深层节点，也不放宽请求体预算。
+需使用包含此功能的源码或镜像；修改容器环境后重新创建容器。保留描述可能增加输入 token 和审核拦截风险；设为 `false` 恢复脱敏默认剥离行为。此开关不改变 Responses 的 balanced/passthrough 模式，也不放宽请求体预算。
 
 ### 流式模式
 
 `stream_mode` 默认 `compatible`，可通过 `--stream-mode compatible|realtime`、`CODEBUDDY2API_STREAM_MODE` 或 WebUI 枚举配置；显式 CLI/环境来源会锁定该项。所有生成请求（含非流式）均在选路前冻结模式及 `max_collect_bytes`，并记录所选模式。热更新只影响后续请求，不改变在途请求及换号；非流式仍返回聚合 JSON，客户端不能按请求覆盖模式。
 
 - `compatible` 保持现有行为：Responses 流式先聚合；Chat/Messages 带工具时先聚合，无工具时沿用上游增量。聚合结果先校验，再按片段重放。两种模式下，非流式请求始终走已校验的聚合路径。
-- `realtime` 让三个协议都增量发送思考、正文、拒绝及工具参数。Responses 在输出项开始时分配稳定索引，Anthropic 使用稳定 block index。适配器在参数阶段或结束标记处确认工具身份，缺失时暂缓工具输出；元数据分片按顺序追加，不按字符串前缀猜测，输出项开始后禁止更换身份。`max_collect_bytes` 约束所保留的 UTF-8 输出，`0` 不限制。
+- `realtime` 让三个协议都实时增量发送正文、拒绝、工具参数与思考，客户端能看到真实的思考时间轴；Responses 与 Anthropic 仍只产生一个逻辑思考项/块并使用稳定索引。`compatible` 保留旧行为：在正文开始前把思考合并成一个事件，会隐藏思考时间轴，并可能让客户端 TPS/首字指标虚高。适配器在参数阶段或结束标记处确认工具身份，缺失时暂缓工具输出；元数据分片按顺序追加，不按字符串前缀猜测，输出项开始后禁止更换身份。`max_collect_bytes` 约束所保留的 UTF-8 输出，`0` 不限制。
 
 实时 Messages 同时只打开一个内容块：当前工具仍增量输出，后续工具、正文或思考块可能等待上游结束，暂存事件字节计入 `max_collect_bytes`。尚未确认身份、未开始内容块的工具不会阻塞其它正文。
 
@@ -68,12 +84,16 @@ Compose 会显式传入部分环境变量及 CLI 参数，删除 `.env` 中的�
 
 明确的纯审核拒绝即使没有正文也保留原生终态：实时 Responses 返回 `response.incomplete`，原因是 `content_filter`，并保留已有用量。普通空响应、缺少终止标记及错误帧仍不得伪装成功。
 
-运行时选回 `compatible` 即可恢复聚合流式及工具参数重生成，保留当前保存状态。源码降级前，移除新增 CLI/环境选项，停止网关并备份**当前**数据目录及同一代 SQLite/WAL/SHM。不要恢复升级前旧库，否则可能回滚新的领取、会话、撤销和账号状态。下例会离线写入当前数据库：仅删除 `settings.stream_mode`、递增 revision 并检查完整性，其它设置和表保持不变；禁止对运行中的数据库执行或混用 SQLite 文件代数。
+运行时选回 `compatible` 即可恢复聚合流式及工具参数重生成，保留当前保存状态。源码降级前，移除新增 CLI/环境选项，停止网关并备份**当前**数据目录及同一代 SQLite/WAL/SHM。不要恢复升级前旧库，否则可能回滚新的领取、会话、撤销和账号状态。下例会离线写入当前数据库：仅删除列出的 `settings.<name>` 键、递增 revision 并检查完整性，其它设置和表保持不变；可传一个或多个键。禁止对运行中的数据库执行或混用 SQLite 文件代数。
 
 ```sh
-python3 - /path/to/control.sqlite3 <<'PY'
+python3 - /path/to/control.sqlite3 settings.stream_mode <<'PY'
 import json, sqlite3, sys
-con = sqlite3.connect(sys.argv[1])
+path, names = sys.argv[1], sys.argv[2:]
+keys = [name.split(".", 1)[1] for name in names if name.count(".") == 1 and name.split(".", 1)[1]]
+if len(keys) != len(names):
+    raise SystemExit("pass one or more settings.<name> keys")
+con = sqlite3.connect(path)
 try:
     con.execute("BEGIN IMMEDIATE")
     row = con.execute("SELECT revision,payload FROM control WHERE id=1").fetchone()
@@ -83,9 +103,11 @@ try:
     data = json.loads(payload)
     if set(data) != {"settings", "models", "credentials"} or not isinstance(data["settings"], dict):
         raise SystemExit("unexpected control payload")
-    if "stream_mode" not in data["settings"]:
-        raise SystemExit("stream_mode is absent; no write needed")
-    del data["settings"]["stream_mode"]
+    present = [key for key in keys if key in data["settings"]]
+    if not present:
+        raise SystemExit("no requested key is present; no write needed")
+    for key in present:
+        del data["settings"][key]
     con.execute("UPDATE control SET revision=?,payload=? WHERE id=1",
                 (revision + 1, json.dumps(data, ensure_ascii=False, allow_nan=False)))
     con.commit()
@@ -101,7 +123,7 @@ PY
 
 ### 连接复用与账号容量
 
-WebUI 系统设置可配置这两项；环境变量为 `CODEBUDDY2API_UPSTREAM_KEEPALIVE` 和 `CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT`，未设置时 Compose 不锁定 WebUI。连接复用默认关闭，启用后每个官方入口最多 64 条连接、保留 16 条空闲连接，空闲复用期限 30 秒；认证头逐请求设置，不保存上游 Cookie，关闭服务时释放连接池。原有代理环境、超时和重放规则不变；关闭并重启恢复逐请求连接。
+WebUI 系统设置可配置这两项；环境变量为 `CODEBUDDY2API_UPSTREAM_KEEPALIVE` 和 `CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT`，在 `.env` 中注释掉对应行时保持 WebUI 可编辑。连接复用默认关闭，启用后每个官方入口最多 64 条连接、保留 16 条空闲连接，空闲复用期限 30 秒；认证头逐请求设置，不保存上游 Cookie，关闭服务时释放连接池。原有代理环境、超时和重放规则不变；关闭并重启恢复逐请求连接。
 
 账号上限默认 `0`；设为正数后，仅在原路由及免费优先范围内避开满载账号，不因免费账号满载而转向收费账号。没有名额时返回 `503 / credential_concurrency_limit` 和 `Retry-After: 3`，不排队、不熔断；结束、断连和失败换号均释放名额。管理凭据 API 提供 `in_flight`、`max_in_flight`；限制只涵盖三个客户端生成接口，每进程独立，多个实例不共享计数。设回 `0` 即恢复原容量策略，不中断已开始的请求。
 
@@ -117,7 +139,9 @@ scoped 模式可选传入 `X-Codebuddy-Session-ID`、`metadata.conversation_id` 
 
 ## 自动化与奖励
 
-自动签到与 Buddy 旅行是按账号设置的开关（WebUI 凭证页）：国内默认开启，国际默认关闭，保存即生效，无需重启。
+自动签到与 Buddy 旅行是按账号设置的开关（WebUI 凭证页）：国内个人账号默认开启，国际默认关闭，保存即生效，无需重启。成长中心仅面向个人账号，企业账号不参与旅行（也不再显示上游 403）。
+
+成长中心补领（`auto_growth`，国内个人账号默认开启）随每小时维护扫描执行，只做接取与领取：领取已完成任务的积分与能量，自身不启动任何行为链。任务级 `growth_auto` 开关（默认全部关闭）把指定任务纳入自动化，扫描随后驱动对应行为链——可能消耗积分的真实对话、应用体验或专家召唤。凭证页展示实时任务列表，支持单任务与已开开关任务的一键手动执行，任务开关可复制到已选账号（`POST /admin/credentials/growth-batch`）；面板由 `GET /admin/credentials/{id}/growth-tasks`、`.../growth-tasks/auto` 与 `.../auto-all` 支撑。手动执行是服务端后台任务（每个账号同时只有一个）：请求立即返回任务，关闭抽屉或页面不影响执行，运行中再次发起会返回当前任务；`GET /admin/growth-jobs` 列出各账号当前或最近一次任务及正在执行的任务，供页面横幅显示。手动执行与扫描领取均入审计；企业与国际账号不显示该面板。
 
 `CODEBUDDY2API_AUTO_ACCEPT_BUDDY` 仅启动读取，默认 `false`；预授权已启用国内账号完成首次领猫任务、协议及旅行，自动旅行仍受账号开关控制。`first_buddy` 无需单独接取，包含 `not_accepted` 在内的待完成状态可直接发起一次本账号的真实国内 WorkBuddy 对话；优先可用零倍率模型，否则取最低已知倍率，最多请求 32 个输出 token，可能消耗少量积分。不执行其他奖励任务、不付费开盒、不切猫、不领取国际试用积分。
 
@@ -151,7 +175,8 @@ scoped 模式可选传入 `X-Codebuddy-Session-ID`、`metadata.conversation_id` 
 | `GET /admin/credentials` | 凭证列表与运行状态 |
 | `POST /admin/credentials` | 从服务端受控目录导入 `.info` |
 | `DELETE /admin/credentials/{name}` | 按文件名删除凭证文件；仍被模型绑定引用时返回 409 |
-| `PATCH /admin/credentials/{id}` | 按账号设置单个布尔字段：`enabled`、`auto_checkin` 或 `auto_travel`；保存自动任务开关不立即领取 |
+| `PATCH /admin/credentials/{id}` | 按账号设置单个布尔字段（`enabled`、`auto_checkin`、`auto_travel`、`auto_daily_chat` 或 `auto_growth`）或 `growth_auto` 任务码映射；保存自动任务开关不立即领取 |
+| `GET /admin/credentials/{id}/growth-tasks` · `POST .../growth-tasks/auto` · `.../auto-all` · `GET /admin/growth-jobs` · `POST /admin/credentials/growth-batch` | 实时成长任务列表；以后台任务执行单任务或全部已开任务；各账号当前与最近任务；为已选账号批量设置任务开关 |
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | 发起与轮询登录；`site=cn`（默认）、`intl`（国际 WorkBuddy）或 `intl-codebuddy`（国际 CodeBuddy） |
 | `GET /admin/credits` · `POST /admin/checkin` | 查询额度；按日幂等签到，国内按开关继续旅行 |
 | `POST /admin/sync` | 同步全部启用账号的余额、目录和用量，不签到、不领取试用 |
@@ -175,7 +200,7 @@ scoped 模式可选传入 `X-Codebuddy-Session-ID`、`metadata.conversation_id` 
 CODEBUDDY2API_ADMIN_CSRF=false
 ```
 
-仅启动时生效，CLI 优先于环境变量，不能通过 WebUI 修改。使用包含该开关的源码或镜像，并更新 Compose 配置；修改环境后须重新创建容器，不能仅执行 `docker compose restart`。旧镜像不会因新增变量自动获得此功能。
+仅启动时生效，CLI 优先于环境变量，不能通过 WebUI 修改。在 `.env` 中写入取值或传入对应参数后重新创建容器，不能仅执行 `docker compose restart`。
 
 关闭会跳过登录请求的 Origin 检查，以及 Cookie 管理写操作和 OAuth 轮询的 Origin/CSRF 检查；API key、会话有效期、OAuth 任务归属、官方授权地址白名单和危险操作确认仍保留，不影响 `/v1/*`。
 
@@ -217,6 +242,13 @@ WebUI 可以直接上传文件；以下限制针对 `POST /admin/credentials` �
 - WebUI 的地域、产品和凭证绑定严格限制候选账号，不会回退到未选账号。模型禁用后直接请求同样拒绝；改名默认不保留原 ID，只有选择保留时才同时提供旧 ID。
 - 已发送请求不会因账号不可用或 HTTP 错误换账号重放；后续请求才重新选路。目录同步或凭证未就绪通常返回带 `Retry-After` 的 503，不支持或禁用的模型返回 404。
 
+选路与目录维护都可切换模式，无需回滚已持久化数据：
+
+- `routing_scheduler`：`shadow`（默认）同时执行旧的全量判断与索引分片，返回旧结果，并把有界、不含凭证信息的差异记录在 `GET /admin/performance`；差异计数持续为零后再切到 `indexed`；`indexed` 按模型、请求内别名和版本组合复用同一份候选分片；`legacy` 每次请求重新判断全部凭证。只有条目身份、策略、已发布目录或账号偿付能力真实变化才会使分片失效，令牌刷新和维护写入不打断稳态。
+- `catalog_probe_mode`：`account`（默认）每周期刷新全部已同步账号；`representative` 每个产品每 TTL 周期只探测一个凭证——无目录账号优先，其次当前来源，再次目录最旧——失败按指数退避，并按每周期有界配额补齐缺失或标脏的账号目录，新账号无需手动扫描即可路由。未探测或失败的账号保留上次可信目录，`/v1/models` 仍是当前账号目录并集，只有代表目录新增模型才会标脏旧版本账号。
+- `POST /admin/models/scan` 在后台把当前全部账号各刷新一次，`GET /admin/models/scan` 返回进度、成功数、失败数、目录差异数、整体错误原因和按产品分组的目录版本分布；它是一次性校准入口，不是周期任务。
+- `housekeep_concurrency`（默认 `4`）限制后台维护并发：余额、目录和用量各自独立限额，设为 `1` 即回到原来的串行周期；账号同步失败按指数退避加抖动重试。5 分钟内已同步的账号会被下一个完整周期跳过，因此事件触发周期不会重复同步。
+
 ### 模型声明与图片兼容
 
 `/v1/models` 保留原字段，增加 `capabilities`、`limits`、`metadata_by_profile`，管理接口及路由预览同步提供。能力状态为 `supported`、`unsupported`、`mixed`、`unknown`；限制含 `state`（`known`、`mixed`、`unknown`）和 `value`，仅已知且一致时返回数值。按产品保留不同账号的声明版本，但不公开账号身份。白名单覆盖说明、能力、窗口、思考选项、关联模型及参数建议；凭据、内部配置和带认证信息的 URL 不公开。上游声明不等于原生能力或实测保证，参数建议不自动覆盖请求。
@@ -225,9 +257,40 @@ WebUI 可以直接上传文件；以下限制针对 `POST /admin/credentials` �
 
 两种国际产品在选路后归并含图的连续 `user` 段，保留内容顺序和图片数据；国内请求、纯文本段及 system/assistant/tool 边界不变。消息级属性冲突或内容无法无损表达时返回 `400 / image_user_run_not_mergeable`，最终字节限制仍生效。图片兼容不随能力开关关闭，不增加重试，也不让文本模型获得原生视觉。
 
+### 实测计费与输出上限
+
+目录倍率只是上游声明；上游开始收费后，模型仍可能继续声明 `x0.00`。每次响应的 `usage` 都带有实际扣费 credit，审计日志按请求保存，因此网关以实测为准，而不是只信声明：
+
+- 某产品声明免费的模型，若该产品近 7 天最近 20 次请求中有任意一次被扣费，即视为**实测计费**，并在各处不再按免费处理：零余额账号不再可用、免费优先排序不再优先、`auto` 不再视其为免费。连续 20 次未扣费后恢复为免费。
+- 流量只能证明模型被计费，不能给出倍率：上游按会话缓存提示词，命中部分约按新输入的 1/20 计费，且常不在 `usage` 中体现，因此按单次扣费折算会把每 token 价格低估一个数量级。实测计费的模型在被探测校准前显示 **实测计费 · 倍率待估** 与平均每次扣费，同样不会被当作免费。
+- 探测时对目标模型与本产品一个已声明付费倍率的参考模型（最接近 0.1x 者）各发一次约 8K token、各自新会话的相同请求；目标倍率 = 参考倍率 × 两者每 token 扣费之比，无需假设任何 token 单价。目标未扣费时不发参考请求。
+- `GET /v1/models` 的 `credits` / `credits_by_profile` 为生效倍率；最低倍率来自估算时额外返回 `credits_estimated: true`。
+- 可按模型 × 产品手填倍率（模型规则的 `credits_override`，范围 `0`–`1000`，`0` 表示确认免费），路由与 `/v1/models` 均以手填值优先于声明与实测。自建别名不单独设倍率，请设在其上游模型的规则上。
+- `POST /admin/models/{id}/rate-probe` 在提供该模型的每个产品上，用有余额的账号发起一次约 8K token 的请求，并记录上游返回的扣费与校准倍率；`POST /admin/models/rate-probe` 对所有被某产品声明免费的模型执行同样探测。两者都启动同一个共享后台任务（并发 4）并立即返回，运行中再次发起会返回当前任务；`GET /admin/models/rate-probe` 返回进度、正在探测的模型/产品/步骤以及全部结果。真正免费的模型探测不消耗积分；被计费的模型消耗其自身请求（约 1x 的模型约 0.6 积分）加参考模型的数个计费单位。每个探测请求（含参考模型）也会写入请求日志，带 token 与扣费：协议为 `rate_probe`，会话 ID 以 `rate-probe-` 为前缀。校准样本在控制库中保留 30 天，不会从日志重复计入。
+
+目录声明的 `maxOutputTokens` 常高于模型实际能输出的量，且更大的 `max_tokens` 不会报错，而是被静默钳制。`scripts/probe_max_tokens.py` 经网关实测真实上限：要求模型数到足以写满当前档位，并区分上游截断（`finish=length` 且输出低于请求值）与模型主动收尾。档位不超过声明值，按 4 个模型并行，每个模型限时 600 秒，结果追加写入 JSONL，`--resume` 可断点续测。
+
+```bash
+python3 scripts/probe_max_tokens.py --key "$CODEBUDDY2API_KEY" --panel-out auth/output_probes.json
+python3 scripts/probe_max_tokens.py --key "$CODEBUDDY2API_KEY" --models glm-5.2 --resume --panel-out auth/output_probes.json
+python3 scripts/probe_max_tokens.py --key "$CODEBUDDY2API_KEY" --dry-run
+```
+
+`--panel-out` 将结果合并写入 `control.sqlite3` 同目录的 `output_probes.json`，未重测的模型保留原记录。`GET /admin/models/output-probes` 只读返回该文件，重跑后下次请求即生效，无需重启。探测会真实消耗积分。
+
+## 思考兼容
+
+Messages 的 `enabled` / `adaptive` 启用 Chat 推理，`output_config.effort` 和 Responses 的 `reasoning.effort` 映射为 `reasoning_effort`。显式顶层 `reasoning_effort` 优先，但 Messages 的 `disabled` 始终使用 `none`；模型能力检查仍生效。未提供控制参数时保留上游默认行为。
+
+未指定强度时，Messages 从实际选中账号的 `reasoning.defaultEffort` 或旧 `reasoning.effort` 选择声明支持的默认值；否则优先 `high`，再选可用选项，声明未知时回落为 `high`。换号后重新解析新账号的默认值。
+
+手工 `enabled` 要求整数 `budget_tokens >= 1024`，但该预算不等于上游精确 token 限额，`max_tokens` 原样转发；兼容映射不模拟原生自适应调度。仅支持 `display: summarized`。
+
+可读历史统一放入 `reasoning_content`，不混入普通正文。Responses 优先使用可读 `content`，其次使用 `summary`；摘要不能还原原生隐藏推理。签名不转发，`redacted_thinking`、仅含加密签名的思考及非空 Responses `encrypted_content` 在选路前返回 400；上游自行决定使用哪些可读历史。
+
 ## 请求边界
 
-- 三个生成协议统一将 `developer` 归一为 `system`，已有 system 移到首位，缺失时补默认值；归一化不修改调用方 payload。Responses 上下文投影和可选脱敏另行处理内容，不能据此理解为整个链路逐字透传。
+- 三个生成协议统一将 `developer` 归一为 `system`，已有 system 移到首位，缺失时补默认值；归一化不修改调用方 payload。可选的 [Responses 投影](#responses-投影)和脱敏会另行处理内容，因此默认链路并非逐字透传。
 - 图片计入全部历史和工具结果，重复图片逐次计数，按消息与内容块数组顺序判断新旧。默认保留最新 16 张，只移除超额图片并保留文本和消息结构；图片清空的内容用文本占位。
 - `--image-policy error` 在本地返回 `413 / too_many_images`。处理后仍超过字节上限则返回 `413 / request_too_large`，不为满足预算继续截断文本。
 - 图片数量合规不保证单图大小或模型视觉能力满足上游要求。URL/base64 图片可转换，Responses 图片 `file_id` 不支持。
@@ -274,4 +337,4 @@ WebUI 可以直接上传文件；以下限制针对 `POST /admin/credentials` �
 
 ## 降级与回滚
 
-功能开关不藏隐状态：关闭守卫或模式即对新请求停止生效，回退源码即恢复旧行为。例外是持久化设置与自动化状态：`control.sqlite3` 保存 WebUI 设置、模型规则与奖励预留，旧代码会拒绝未知字段。源码降级前移除新增的启动参数，停止服务，备份**当前**数据目录，并使用上面的窄范围离线 `settings.stream_mode` 删除流程，递增 revision 并执行完整性检查。不要恢复升级前数据库，也不要混用 WAL/SHM 代数，否则可能回滚较新的领取、会话、撤销和账号状态。回滚无法撤销已完成的上游签到、领取或旅行派出。
+功能开关不藏隐状态：关闭守卫或模式即对新请求停止生效，回退源码即恢复旧行为。例外是持久化设置与自动化状态：`control.sqlite3` 保存 WebUI 设置、模型规则与奖励预留，旧代码会拒绝未知字段。源码降级前移除新增的启动参数，停止服务，备份**当前**数据目录，并使用上面的窄范围离线 `settings.<name>` 删除流程，递增 revision 并执行完整性检查。不要恢复升级前数据库，也不要混用 WAL/SHM 代数，否则可能回滚较新的领取、会话、撤销和账号状态。回滚无法撤销已完成的上游签到、领取或旅行派出。

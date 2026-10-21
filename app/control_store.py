@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import copy
 import json
+import math
+from datetime import date
+import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -11,6 +14,7 @@ import uuid
 
 from .settings import validate_settings
 from .audit_store import _secure_path, safe_label
+from .growth_tasks import KNOWN_TASK_CODES as GROWTH_TASK_CODES
 
 
 class ConflictError(ValueError):
@@ -23,6 +27,23 @@ def _identifier(value, label):
     return value
 
 
+def _day(value, label="日期"):
+    """Accept only a YYYY-MM-DD local calendar day; never a timestamp or free text.
+
+    The shape check alone admits 2026-02-31 and 2026-99-99, and a day that never
+    happened would become a distinct key that the once-per-day guard could be
+    satisfied against instead of the real day.
+    """
+    if (not isinstance(value, str) or len(value) != 10 or value[4] != "-" or value[7] != "-"
+            or not value.replace("-", "").isdigit()):
+        raise ValueError(f"{label} 无效")
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"{label} 无效") from None
+    return value
+
+
 def buddy_claim_reserved(record):
     """Only pre-claim reservations may expire; a pending send can outlive its process."""
     return bool(record and (record["claimed"] or record["stage"] not in {"reserved", "agree", "buddy_agree"}))
@@ -30,7 +51,7 @@ def buddy_claim_reserved(record):
 
 def validate_model(source, rule, models=None, known_models=(), *, legacy_scopes=False):
     _identifier(source, "模型规则 ID")
-    if not isinstance(rule, dict) or set(rule) - {"public_id", "upstream_id", "custom", "enabled", "keep_original", "region", "profile", "credential_ids"}:
+    if not isinstance(rule, dict) or set(rule) - {"public_id", "upstream_id", "custom", "enabled", "keep_original", "region", "profile", "credential_ids", "credits_override"}:
         raise ValueError("模型规则字段无效")
     clean = {"public_id": source, "upstream_id": source, "custom": False,
              "enabled": True, "keep_original": False,
@@ -56,6 +77,18 @@ def validate_model(source, rule, models=None, known_models=(), *, legacy_scopes=
         raise ValueError("账号指纹重复")
     if ids and (clean["region"] or clean["profile"]) and not legacy_scopes:
         raise ValueError("指定账号与区域/产品范围只能选择一种")
+    # Manual rates sit on the catalog model itself; an empty mapping is not stored at all.
+    override = clean.pop("credits_override", None)
+    override = {} if override is None else override
+    if (not isinstance(override, dict)
+            or set(override) - {"cn-cli", "cn-work", "intl-cli", "intl-work"}
+            or any(isinstance(rate, bool) or not isinstance(rate, (int, float))
+                   or not math.isfinite(rate) or not 0 <= rate <= 1000 for rate in override.values())):
+        raise ValueError("credits_override 必须是产品到 0–1000 倍率的映射")
+    if override and clean["custom"]:
+        raise ValueError("自建模型不能手填倍率，请在其上游模型的规则上设置")
+    if override:
+        clean["credits_override"] = {profile: float(rate) for profile, rate in sorted(override.items())}
     all_rules = {**(models or {}), source: clean}
     real_ids = set(known_models) | set(all_rules) | {"auto"}
     aliases = {}
@@ -107,9 +140,27 @@ class ControlStore:
                              "accept_started INTEGER NOT NULL DEFAULT 0, chat_started INTEGER NOT NULL DEFAULT 0, "
                              "completed INTEGER NOT NULL DEFAULT 0, model TEXT, chat_state TEXT NOT NULL DEFAULT 'pending', "
                              "total_tokens INTEGER, updated_at REAL NOT NULL)")
+            self._db.execute("CREATE TABLE IF NOT EXISTS daily_chats ("
+                             "account_key TEXT NOT NULL, day TEXT NOT NULL, attempt_id TEXT NOT NULL, "
+                             "phase TEXT NOT NULL, conversation_id TEXT, sandbox_status TEXT, "
+                             "usage_before REAL, usage_after REAL, acp_usage REAL, "
+                             "reserved_at REAL NOT NULL, confirmed_at REAL, updated_at REAL NOT NULL, "
+                             "PRIMARY KEY (account_key, day))")
+            # One row per manual rate probe: the charge upstream reported for a known-size request.
+            self._db.execute("CREATE TABLE IF NOT EXISTS rate_probes ("
+                             "probed_at REAL NOT NULL, profile TEXT NOT NULL, model TEXT NOT NULL, "
+                             "credit REAL NOT NULL, input_tokens INTEGER NOT NULL, "
+                             "cache_read_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL)")
+            self._db.execute("CREATE INDEX IF NOT EXISTS rate_probes_time ON rate_probes(probed_at)")
+            # Additive: the calibrated rate of a charged probe, NULL when it could not be derived.
+            if "rate" not in [row[1] for row in self._db.execute("PRAGMA table_info(rate_probes)")]:
+                self._db.execute("ALTER TABLE rate_probes ADD COLUMN rate REAL")
             self._db.execute("CREATE TABLE IF NOT EXISTS runtime_state (name TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             self._db.execute("CREATE TABLE IF NOT EXISTS state_imports (name TEXT PRIMARY KEY, imported INTEGER NOT NULL, migrated_at REAL NOT NULL)")
             self._db.execute("CREATE TABLE IF NOT EXISTS gateway_secrets (name TEXT PRIMARY KEY, value TEXT NOT NULL, announced INTEGER NOT NULL DEFAULT 0 CHECK(announced IN (0,1)))")
+            # Running-instance lease; heartbeat writes bypass the settings revision on purpose.
+            self._db.execute("CREATE TABLE IF NOT EXISTS service_lease (id INTEGER PRIMARY KEY CHECK(id=1), "
+                             "pid INTEGER NOT NULL, started_at REAL NOT NULL, heartbeat_at REAL NOT NULL)")
             self._db.execute("PRAGMA user_version=2")
             self._db.execute("COMMIT")
         except Exception:
@@ -134,9 +185,18 @@ class ControlStore:
             validate_model(source, rule, data["models"], legacy_scopes=True)  # Preserve legacy scope intersections.
         for identity, metadata in data["credentials"].items():
             _identifier(identity, "账号指纹")
-            if (not isinstance(metadata, dict) or set(metadata) - {"enabled", "label", "auto_checkin", "auto_travel"}
+            growth = metadata.get("growth_auto")
+            if (not isinstance(metadata, dict)
+                    or set(metadata) - {"enabled", "label", "auto_checkin", "auto_travel",
+                                        "auto_daily_chat", "auto_growth", "growth_auto"}
                     or type(metadata.get("enabled")) is not bool
-                    or any(key in metadata and type(metadata[key]) is not bool for key in ("auto_checkin", "auto_travel"))):
+                    or metadata.get("auto_growth") is not None and type(metadata["auto_growth"]) is not bool
+                    or any(key in metadata and type(metadata[key]) is not bool for key in
+                           ("auto_checkin", "auto_travel", "auto_daily_chat"))
+                    or growth is not None and (
+                        not isinstance(growth, dict)
+                        or set(growth) - set(GROWTH_TASK_CODES)
+                        or any(type(value) is not bool for value in growth.values()))):
                 raise ValueError("管理数据库凭证元数据无效")
         return {"revision": row[0], **data}
 
@@ -144,6 +204,11 @@ class ControlStore:
         """Return a detached snapshot; callers cannot mutate the published state."""
         # Published dictionaries are never mutated; SQLite writer locks cannot stall routing.
         return copy.deepcopy(self._snapshot)
+
+    @property
+    def revision(self):
+        """Current revision without copying the snapshot, for cache and policy views."""
+        return self._snapshot["revision"]
 
     def _update(self, revision, change):
         with self._lock:
@@ -193,6 +258,43 @@ class ControlStore:
             raise ValueError("enabled 必须为布尔值")
         return self._update(None, lambda state: state["credentials"].setdefault(account_key, {}).update(enabled=enabled))
 
+    def unbind_credential(self, account_key):
+        """Drop an account key from every rule, returning {source: old_ids} for rollback."""
+        _identifier(account_key, "账号指纹")
+        if not any(account_key in (rule.get("credential_ids") or [])
+                   for rule in self.snapshot()["models"].values()):
+            return {}  # Nothing references the identity; keep the revision stable.
+        affected = {}
+        def change(state):
+            for source, rule in state["models"].items():
+                ids = rule.get("credential_ids") or []
+                if account_key in ids:
+                    affected[source] = list(ids)
+                    rule["credential_ids"] = [identity for identity in ids if identity != account_key]
+        self._update(None, change)
+        return affected
+
+    def restore_bindings(self, account_key, affected):
+        """Re-add the identity where a rule still matches its post-unbind state.
+
+        Concurrent edits that changed a rule's binding list are preserved.
+        """
+        _identifier(account_key, "账号指纹")
+        pending = {source: ids for source, ids in dict(affected or {}).items() if isinstance(ids, list)}
+        def restorable(rule, ids):
+            if rule is None:
+                return False  # A rule deleted meanwhile stays deleted.
+            current = rule.get("credential_ids") or []
+            return current == [identity for identity in ids if identity != account_key]
+        snapshot = self.snapshot()
+        if not any(restorable(snapshot["models"].get(source), ids) for source, ids in pending.items()):
+            return snapshot  # Nothing to restore; concurrent edits win.
+        def change(state):
+            for source, ids in pending.items():
+                if restorable(state["models"].get(source), ids):
+                    state["models"][source]["credential_ids"] = list(ids)
+        return self._update(None, change)
+
     def set_auto_checkin(self, account_key, enabled):
         _identifier(account_key, "账号指纹")
         if type(enabled) is not bool:
@@ -206,6 +308,29 @@ class ControlStore:
             raise ValueError("auto_travel 必须为布尔值")
         return self._update(None, lambda state: state["credentials"].setdefault(
             account_key, {"enabled": True}).update(auto_travel=enabled))
+
+    def set_auto_daily_chat(self, account_key, enabled):
+        _identifier(account_key, "账号指纹")
+        if type(enabled) is not bool:
+            raise ValueError("auto_daily_chat 必须为布尔值")
+        return self._update(None, lambda state: state["credentials"].setdefault(
+            account_key, {"enabled": True}).update(auto_daily_chat=enabled))
+
+    def set_auto_growth(self, account_key, enabled):
+        _identifier(account_key, "账号指纹")
+        if type(enabled) is not bool:
+            raise ValueError("auto_growth 必须为布尔值")
+        return self._update(None, lambda state: state["credentials"].setdefault(
+            account_key, {"enabled": True}).update(auto_growth=enabled))
+
+    def set_growth_auto(self, account_key, mapping):
+        """Replace the per-task automation switches; unknown codes are rejected, not dropped."""
+        _identifier(account_key, "账号指纹")
+        if not isinstance(mapping, dict) or set(mapping) - set(GROWTH_TASK_CODES) \
+                or any(type(value) is not bool for value in mapping.values()):
+            raise ValueError("growth_auto 必须是 task_code 到布尔的映射")
+        return self._update(None, lambda state: state["credentials"].setdefault(
+            account_key, {"enabled": True}).update(growth_auto=mapping))
 
     def has_buddy_consent(self, identity, revision):
         _identifier(identity, "账号指纹")
@@ -387,6 +512,180 @@ class ControlStore:
                              "WHERE account_key=?",
                              (int(completed), chat_state, total_tokens, time.time(), identity))
 
+
+    # -- International daily-activity turns ------------------------------------
+    # One row per account per local day. A turn may consume credits on the account
+    # and is never replayed automatically, so only an unsent reservation is
+    # cancellable: a sent-but-unconfirmed one stays pending until the next day.
+
+    _DAILY_CHAT_PHASES = ("reserved", "sent", "confirmed", "cancelled", "reconciled")
+
+    _DAILY_CHAT_TRANSITIONS = {"sent": ("reserved",),
+                               "confirmed": ("sent", "confirmed", "reconciled"),
+                               "cancelled": ("reserved", "sent", "cancelled"),
+                               "reconciled": ("reserved", "sent", "confirmed", "reconciled")}
+    _DAILY_CHAT_UPDATE_SQL = {
+        "sent": "UPDATE daily_chats SET phase=CASE WHEN phase='reconciled' AND ?='confirmed' THEN phase ELSE ? END, "
+                "confirmed_at=CASE WHEN ? IN ('confirmed','reconciled') THEN COALESCE(confirmed_at,?) ELSE confirmed_at END, "
+                "updated_at=? WHERE account_key=? AND day=? AND attempt_id=? AND phase IN (?)",
+        "confirmed": "UPDATE daily_chats SET phase=CASE WHEN phase='reconciled' AND ?='confirmed' THEN phase ELSE ? END, "
+                     "confirmed_at=CASE WHEN ? IN ('confirmed','reconciled') THEN COALESCE(confirmed_at,?) ELSE confirmed_at END, "
+                     "updated_at=? WHERE account_key=? AND day=? AND attempt_id=? AND phase IN (?,?,?)",
+        "cancelled": "UPDATE daily_chats SET phase=CASE WHEN phase='reconciled' AND ?='confirmed' THEN phase ELSE ? END, "
+                     "confirmed_at=CASE WHEN ? IN ('confirmed','reconciled') THEN COALESCE(confirmed_at,?) ELSE confirmed_at END, "
+                     "updated_at=? WHERE account_key=? AND day=? AND attempt_id=? AND phase IN (?,?,?)",
+        "reconciled": "UPDATE daily_chats SET phase=CASE WHEN phase='reconciled' AND ?='confirmed' THEN phase ELSE ? END, "
+                      "confirmed_at=CASE WHEN ? IN ('confirmed','reconciled') THEN COALESCE(confirmed_at,?) ELSE confirmed_at END, "
+                      "updated_at=? WHERE account_key=? AND day=? AND attempt_id=? AND phase IN (?,?,?,?)",
+    }
+    def daily_chat_record(self, identity, day):
+        _identifier(identity, "账号指纹")
+        _day(day)
+        with self._lock:
+            cursor = self._db.execute("SELECT * FROM daily_chats WHERE account_key=? AND day=?",
+                                      (identity, day))
+            row = cursor.fetchone()
+            return dict(zip((column[0] for column in cursor.description), row)) if row else None
+
+    def reserve_daily_chat(self, identity, day):
+        """Reserve the single daily turn; a completed or already-sent day is never reopened.
+
+        A ``reserved`` row is retryable because it means nothing was written upstream
+        yet (the caller only marks ``sent`` once the turn can really run), so a crash
+        or a failed sandbox provisioning does not cost the day.
+        """
+        _identifier(identity, "账号指纹")
+        _day(day)
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                previous = self.daily_chat_record(identity, day)
+                if previous and previous["phase"] not in {"reserved", "cancelled", "reconciled"}:
+                    self._db.execute("COMMIT")
+                    return None
+                attempt = uuid.uuid4().hex
+                self._db.execute(
+                    "INSERT INTO daily_chats (account_key,day,attempt_id,phase,reserved_at,updated_at) "
+                    "VALUES(?,?,?,'reserved',?,?) ON CONFLICT(account_key,day) DO UPDATE SET "
+                    "attempt_id=excluded.attempt_id,phase='reserved',conversation_id=NULL,"
+                    "sandbox_status=NULL,usage_before=NULL,usage_after=NULL,acp_usage=NULL,"
+                    "reserved_at=excluded.reserved_at,confirmed_at=NULL,updated_at=excluded.updated_at",
+                    (identity, day, attempt, time.time(), time.time()))
+                self._db.execute("COMMIT")
+                return {"attempt_id": attempt}
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+
+    def transition_daily_chat(self, identity, day, attempt, phase):
+        """Late receipts cannot reopen or replace an already reconciled reservation."""
+        _identifier(identity, "账号指纹")
+        _day(day)
+        _identifier(attempt, "尝试 ID")
+        if phase not in self._DAILY_CHAT_PHASES:
+            raise ValueError("打卡阶段无效")
+        expected = self._DAILY_CHAT_TRANSITIONS[phase]
+        with self._lock:
+            updated = self._db.execute(
+                self._DAILY_CHAT_UPDATE_SQL[phase],
+                (phase, phase, phase, time.time(), time.time(), identity, day, attempt, *expected))
+            if updated.rowcount != 1:
+                raise ValueError("打卡预留已变化")
+
+    def daily_chat_checkpoint(self, identity, day, *, sandbox_status=None, usage_before=None,
+                              usage_after=None, acp_usage=None, conversation_id=None):
+        _identifier(identity, "账号指纹")
+        _day(day)
+        if sandbox_status is not None:
+            _identifier(sandbox_status, "会话状态")
+        if conversation_id is not None:
+            _identifier(conversation_id, "会话 ID")
+        for name, value in (("usage_before", usage_before), ("usage_after", usage_after),
+                            ("acp_usage", acp_usage)):
+            if value is not None and (type(value) not in (int, float) or not 0 <= value <= 10**9):
+                raise ValueError(f"{name} 无效")
+        with self._lock:
+            self._db.execute(
+                "UPDATE daily_chats SET sandbox_status=COALESCE(?,sandbox_status), "
+                "conversation_id=COALESCE(?,conversation_id), usage_before=COALESCE(?,usage_before), "
+                "usage_after=COALESCE(?,usage_after), acp_usage=COALESCE(?,acp_usage), updated_at=? "
+                "WHERE account_key=? AND day=?",
+                (sandbox_status, conversation_id, usage_before, usage_after, acp_usage,
+                 time.time(), identity, day))
+
+    def daily_chat_done(self, identity, day):
+        record = self.daily_chat_record(identity, day)
+        return bool(record and record["phase"] in {"confirmed", "reconciled"})
+
+    def prune_daily_chats(self, keep_days=30):
+        """Drop old rows; records are diagnostic, never a source of truth for routing."""
+        keep_days = int(keep_days)
+        if not 1 <= keep_days <= 3650:
+            raise ValueError("保留天数无效")
+        cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - keep_days * 86400))
+        with self._lock:
+            self._db.execute("DELETE FROM daily_chats WHERE day<?", (cutoff,))
+
+
+    def record_rate_probe(self, profile, model, sample, rate=None):
+        """Persist one probe outcome; only the billing figures are kept, never the request."""
+        if profile not in ("cn-cli", "cn-work", "intl-cli", "intl-work"):
+            raise ValueError("产品无效")
+        _identifier(model, "模型 ID")
+        values = [sample.get(key) for key in ("credit", "input_tokens", "cache_read_tokens", "output_tokens")]
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+               or value < 0 for value in values):
+            raise ValueError("探测结果无效")
+        if rate is not None and (isinstance(rate, bool) or not isinstance(rate, (int, float))
+                                 or not math.isfinite(rate) or not 0 <= rate <= 1000):
+            raise ValueError("探测倍率无效")
+        with self._lock:
+            self._db.execute("INSERT INTO rate_probes(probed_at,profile,model,credit,input_tokens,"
+                             "cache_read_tokens,output_tokens,rate) VALUES(?,?,?,?,?,?,?,?)",
+                             (time.time(), profile, model, float(values[0]),
+                              *(int(value) for value in values[1:]), rate))
+
+    def rate_probes(self, since):
+        """Probe rows in the sample shape the rate measurement consumes, oldest first."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT probed_at,profile,model,credit,input_tokens,cache_read_tokens,output_tokens,rate "
+                "FROM rate_probes WHERE probed_at>=? ORDER BY probed_at", (since,)).fetchall()
+        keys = ("started_at", "profile", "model", "credit", "input_tokens", "cache_read_tokens",
+                "output_tokens", "rate")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def prune_rate_probes(self, keep_days=30):
+        cutoff = time.time() - int(keep_days) * 86400
+        with self._lock:
+            self._db.execute("DELETE FROM rate_probes WHERE probed_at<?", (cutoff,))
+
+    def claim_service_lease(self) -> None:
+        """Mark this process as the running instance so offline tools can refuse to write."""
+        now = time.time()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO service_lease (id, pid, started_at, heartbeat_at) VALUES (1, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET pid=excluded.pid, started_at=excluded.started_at, "
+                "heartbeat_at=excluded.heartbeat_at", (os.getpid(), now, now))
+
+    def heartbeat_service_lease(self) -> None:
+        """Refresh only our own lease row; a superseded process never extends another's."""
+        with self._lock:
+            self._db.execute("UPDATE service_lease SET heartbeat_at=? WHERE id=1 AND pid=?",
+                             (time.time(), os.getpid()))
+
+    def release_service_lease(self) -> None:
+        """Drop a cleanly stopped process's lease so an offline migration need not wait it out."""
+        with self._lock:
+            self._db.execute("DELETE FROM service_lease WHERE id=1 AND pid=?", (os.getpid(),))
+
+    def service_lease(self) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT pid, started_at, heartbeat_at FROM service_lease WHERE id=1").fetchone()
+        return {"pid": row[0], "started_at": row[1], "heartbeat_at": row[2]} if row else None
 
     def close(self):
         with self._lock:

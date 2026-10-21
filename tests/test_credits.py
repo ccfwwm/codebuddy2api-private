@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct exe
 
 from app import credits
 from app.credits import (
-    AuthExpiredError, CreditLedger,
+    AuthExpiredError, CreditLedger, balance_changes,
     classify_checkin_result, token_issuer_origin, hosts_for_token,
     extract_segments, merge_segments, soonest_expiry,
 )
@@ -240,6 +240,51 @@ def test_ledger(tmp_path=None):
         snap = ledger2.snapshot()
         assert snap["c1"]["credits"]["credits"] == 300.0
     print("✅ test_ledger")
+
+
+def _balance(*segments, **flags):
+    return {"credits": round(sum(s["remaining"] for s in segments), 2), "segments": list(segments), **flags}
+
+
+def _segment(code, remaining, total=None, expires_at=2e9, source="包"):
+    return {"package_code": code, "source": source, "remaining": remaining,
+            "total": remaining if total is None else total, "expires_at": expires_at}
+
+
+def test_balance_changes_explain_income_consumption_and_expiry():
+    """Rows name each package grant and expiry, fold spending into one row and sum to the delta."""
+    now = 1_900_000_000
+    before = _balance(_segment("daily", 100, 100), _segment("old", 30, 50, expires_at=now - 60))
+    after = _balance(_segment("daily", 80, 100), _segment("trial", 450, 500, source="体验积分"))
+    changes = balance_changes(before, after, now=now)
+    # Packages are visited in expiry order; consumption across packages comes last as one row.
+    assert [(c["type"], c["delta"]) for c in changes] == [("expire", -30.0), ("income", 500.0), ("consume", -70.0)]
+    assert changes[1]["source"] == "体验积分" and changes[1]["package_code"] == "trial"
+    assert {c["balance"] for c in changes} == {530.0}
+    assert round(sum(c["delta"] for c in changes), 2) == round(after["credits"] - before["credits"], 2)
+    # A package that left the list before its expiry was spent down, not expired.
+    spent = balance_changes(_balance(_segment("a", 5)), _balance(), now=now)
+    assert [(c["type"], c["delta"]) for c in spent] == [("consume", -5.0)]
+    # A top-up of an existing package is income; a rise its totals cannot explain is an adjustment.
+    topped = balance_changes(_balance(_segment("a", 10, 20)), _balance(_segment("a", 25, 30)), now=now)
+    assert [(c["type"], c["delta"]) for c in topped] == [("income", 10.0), ("adjust", 5.0)]
+    assert balance_changes(_balance(_segment("a", 10)), _balance(_segment("a", 10)), now=now) == []
+    print("✅ test_balance_changes_explain_income_consumption_and_expiry")
+
+
+def test_balance_changes_skip_incomparable_snapshots():
+    """No earlier balance, a partial page, enterprise quota or a site change records nothing."""
+    after = _balance(_segment("a", 10))
+    for before, current in (({}, after), (_balance(partial=True), after), (_balance(), dict(after, partial=True)),
+                            (_balance(enterprise=True), after), (_balance(intl=True), after)):
+        assert balance_changes(before, current) == []
+    with tempfile.TemporaryDirectory() as td:
+        ledger = CreditLedger(Path(td) / "ledger.json")
+        assert ledger.update_credits("c1", after) == []   # First balance of a credential.
+        assert [c["type"] for c in ledger.update_credits("c1", _balance(_segment("a", 4)))] == ["consume"]
+        ledger.bind_identity("c1", "another-account")       # A rebound path starts over.
+        assert ledger.update_credits("c1", after) == []
+    print("✅ test_balance_changes_skip_incomparable_snapshots")
 
 
 def test_ledger_remove_and_entry():
@@ -506,6 +551,9 @@ def _fake_client(pages, seen=None):
     """Return predefined HTTP responses by page number."""
     class FakeResp:
         status_code = 200
+        headers = {}
+        content = b""
+        text = ""
         def __init__(self, payload):
             self._p = payload
         def json(self):
@@ -563,6 +611,83 @@ def test_fetch_credits_distinguishes_empty_from_missing_structure():
         except RuntimeError as error:
             assert "Accounts" in str(error)
     print("✅ test_fetch_credits_distinguishes_empty_from_missing_structure")
+
+
+def test_fetch_credits_diagnoses_non_json_response():
+    """Include safe response metadata when billing returns an HTML page."""
+    token = _jwt("https://www.codebuddy.cn/x")
+    class FakeResp:
+        status_code = 200
+        headers = {"content-type": "text/html; charset=utf-8"}
+        content = b"<html>accessToken=secret-value</html>"
+        text = "<html>accessToken=secret-value</html>"
+
+        def json(self):
+            raise ValueError("not JSON")
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, *args, **kwargs):
+            return FakeResp()
+
+    try:
+        _with_client(FakeClient, lambda: credits.fetch_credits(token))
+        raise AssertionError("non-JSON response must raise")
+    except RuntimeError as error:
+        message = str(error)
+        assert "非 JSON" in message and "text/html" in message and "字节" in message
+        assert "secret-value" not in message
+
+
+def test_fetch_credits_diagnoses_top_level_list():
+    """Describe a JSON response whose top level is not an object."""
+    token = _jwt("https://www.codebuddy.cn/x")
+    try:
+        _with_client(_fake_client([["secret-value"]]), lambda: credits.fetch_credits(token))
+        raise AssertionError("list response must raise")
+    except RuntimeError as error:
+        assert "顶层为 list" in str(error)
+        assert "secret-value" not in str(error)
+
+
+def test_fetch_credits_diagnoses_missing_accounts_keys():
+    """Describe missing Accounts with keys only, never response values."""
+    token = _jwt("https://www.codebuddy.cn/x")
+    payload = {"code": 0, "msg": "secret-value", "data": {"trace": "secret-value"}}
+    try:
+        _with_client(_fake_client([payload]), lambda: credits.fetch_credits(token))
+        raise AssertionError("missing Accounts must raise")
+    except RuntimeError as error:
+        message = str(error)
+        assert "缺少 Accounts 结构" in message and "顶层 键：code,msg,data" in message
+        assert "secret-value" not in message
+    renamed = {"code": 0, "data": {"Response": {"Data": {"AccountList": [], "TotalCount": 0},
+                                                "RequestId": "trace"}}}
+    try:
+        _with_client(_fake_client([renamed]), lambda: credits.fetch_credits(token))
+        raise AssertionError("renamed Accounts must raise")
+    except RuntimeError as error:
+        assert "AccountList,TotalCount" in str(error)  # 深层键名不得被 null 层挤出预算
+        assert "为 null" not in str(error)
+
+
+def test_fetch_credits_tolerates_unrelated_shape_noise():
+    """Parse Accounts even when unused sibling fields carry unexpected types."""
+    token = _jwt("https://www.codebuddy.cn/x")
+    account = {"Remain": 5}
+    for payload in ({"code": 0, "data": {"Response": {"Data": {"Accounts": [account]}},
+                                        "data": "x"}},
+                    {"code": 0, "data": {"Response": {"Data": {"Accounts": [account]}},
+                                        "data": [1]}},
+                    {"code": 0, "data": {"Accounts": [account], "Response": ""}}):
+        result = _with_client(_fake_client([payload]), lambda: credits.fetch_credits(token))
+        assert result["credits"] == 5.0 and result["count"] == 1
+    print("✅ test_fetch_credits_tolerates_unrelated_shape_noise")
 
 
 def test_fetch_credits_paginates_until_short_page():
@@ -991,6 +1116,8 @@ if __name__ == "__main__":
     test_merge_and_sort_segments()
     test_soonest_expiry()
     test_ledger()
+    test_balance_changes_explain_income_consumption_and_expiry()
+    test_balance_changes_skip_incomparable_snapshots()
     test_ledger_remove_and_entry()
     test_ledger_threaded_entries()
     test_daily_checkin_http()
@@ -1002,6 +1129,10 @@ if __name__ == "__main__":
     test_aggregate_credits()
     test_fetch_request_usage_rejects_invalid_success_payloads()
     test_fetch_credits_distinguishes_empty_from_missing_structure()
+    test_fetch_credits_diagnoses_non_json_response()
+    test_fetch_credits_diagnoses_top_level_list()
+    test_fetch_credits_diagnoses_missing_accounts_keys()
+    test_fetch_credits_tolerates_unrelated_shape_noise()
     test_sync_usage_keeps_per_account_snapshots_on_failure()
     test_fetch_credits_paginates_until_short_page()
     test_fetch_request_usage_marks_partial_at_page_cap()

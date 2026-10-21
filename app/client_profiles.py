@@ -38,12 +38,14 @@ def identity_headers(profile: str) -> dict:
 
 
 def _auth_headers(auth: dict, account: dict) -> dict:
+    # Read the tenant id through the shared helper so header and billing dispatch agree.
+    enterprise_id = enterprise_id_of(account) or ""
     headers = {
         "Content-Type": "application/json", "Accept": "application/json",
         "Authorization": f"Bearer {auth.get('accessToken', '')}",
         "X-User-Id": str(account.get("uid") or ""),
-        "X-Enterprise-Id": str(account.get("enterpriseId") or ""),
-        "X-Tenant-Id": str(account.get("enterpriseId") or ""),
+        "X-Enterprise-Id": enterprise_id,
+        "X-Tenant-Id": enterprise_id,
         "X-Domain": domain_for_auth(auth),
         "X-Product": "SaaS", "X-Requested-With": "XMLHttpRequest",
     }
@@ -54,6 +56,11 @@ def _auth_headers(auth: dict, account: dict) -> dict:
 def credential_headers(auth: dict, account: dict) -> dict:
     return {**SDK_HEADERS, **_auth_headers(auth, account)}
 
+def refresh_headers(domain: str, uid: str = "") -> dict:
+    """Build headers for a refresh exchange that has no access token yet."""
+    headers = {**SDK_HEADERS, **_auth_headers({"accessToken": "", "domain": domain}, {"uid": uid})}
+    headers.pop("Authorization", None)  # The refresh token is the only credential in this request.
+    return headers
 
 def catalog_headers(auth: dict, account: dict | None = None, *, user_agent="") -> dict:
     headers = _auth_headers(auth, account or {})
@@ -71,6 +78,93 @@ def account_key(profile: str, uid, enterprise_id="") -> str:
     identity = json.dumps([profile, str(uid or ""), str(enterprise_id or "")],
                           ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def enterprise_id_of(account) -> str | None:
+    """Read the tenant identifier in either naming convention.
+
+    The official clients emit ``enterpriseId`` from the auth payload and
+    ``enterprise_id`` in some backup shapes; both must resolve to one value so the
+    billing dispatch and the request headers never disagree.
+    """
+    if not isinstance(account, dict):
+        return None
+    for field in ("enterpriseId", "enterprise_id"):
+        value = account.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def is_enterprise_account(account) -> bool:
+    """Whether the account belongs to an enterprise tenant.
+
+    An enterprise id is a direct hit. Historical backups may carry only
+    ``type in {ultimate, exclusive}`` without the id, but those accounts still bill
+    through the enterprise endpoint, so the type is a fallback signal.
+    """
+    if enterprise_id_of(account) is not None:
+        return True
+    if not isinstance(account, dict):
+        return False
+    account_type = account.get("type")
+    return isinstance(account_type, str) and account_type.strip().lower() in ("ultimate", "exclusive")
+
+
+def normalize_uid(value) -> str:
+    """Coerce a uid to its canonical string form, treating blanks as absent.
+
+    A numeric uid is a real identity: it must hash the same as its string form and
+    must never be mistaken for a missing uid, which would let two different
+    accounts collapse onto one key.
+    """
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        # Reject non-finite and fractional values: they are not account identifiers.
+        return str(int(value)) if value.is_integer() else ""
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+# Display placeholders that must never be used as an identity.
+_PLACEHOLDER_IDENTITIES = frozenset({"unknown", "手动添加", "未命名账号"})
+
+
+def identity_email(account) -> str | None:
+    """Return a real email usable as an identity when no uid exists.
+
+    Placeholders, and values that merely repeat another field, are rejected: they
+    would merge unrelated accounts onto a single key.
+    """
+    if not isinstance(account, dict):
+        return None
+    email = account.get("email")
+    if not isinstance(email, str):
+        return None
+    text = email.strip()
+    if not text or "@" not in text or text.lower() in _PLACEHOLDER_IDENTITIES:
+        return None
+    if text == normalize_uid(account.get("uid")):
+        return None
+    nickname = account.get("nickname")
+    if isinstance(nickname, str) and text == nickname.strip():
+        return None
+    return text.lower()
+
+
+def canonical_uid(account) -> str:
+    """The identity uid for an account block, falling back to a real email.
+
+    Every caller that derives an identity (import validation, hashing, sync
+    reconciliation, duplicate detection) must use this one function so the keys
+    they compare are always the same key.
+    """
+    return normalize_uid((account or {}).get("uid") if isinstance(account, dict) else None) \
+        or (identity_email(account) or "")
 
 
 def catalog_cache_key(profile: str, identity: str | None = None) -> str:

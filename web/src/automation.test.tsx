@@ -1,8 +1,17 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vite-plus/test";
 import { Credentials } from "./pages/Credentials";
-import { api, credentialResponse, useResource } from "./api";
+import { api, credentialResponse, useResource, type Credential } from "./api";
 import { TravelSummary } from "./Travel";
+
+function openRowMenu(credentialName: string) {
+  const row = screen
+    .getAllByText(credentialName)
+    .map((el) => el.closest<HTMLElement>("tr, article"))
+    .find((tr) => tr && within(tr).queryByRole("button", { name: /^更多/ }));
+  if (!row) throw new Error(`row for ${credentialName} not found`);
+  fireEvent.click(within(row).getByRole("button", { name: /^更多/ }));
+}
 
 vi.mock("./api", async (original) => ({
   ...(await original<typeof import("./api")>()),
@@ -10,7 +19,7 @@ vi.mock("./api", async (original) => ({
 }));
 beforeEach(() => vi.restoreAllMocks());
 function fixture() {
-  const rows = [
+  const rows: Credential[] = [
     {
       id: "cn",
       name: "cn.info",
@@ -29,15 +38,27 @@ function fixture() {
       profile: "intl-work",
       enabled: true,
       health: "ready",
+      catalog_ready: true,
+      sync_pending: true,
+      sync_error: "credits: billing unavailable",
       auto_checkin: false,
       auto_travel: false,
       travel_supported: false,
+      daily_chat_supported: true,
+      auto_daily_chat: false,
       checkin: { state: "inactive", date: "2026-09-15", message: "签到活动未开放或已结束" },
       travel: { state: "unknown", message: "尚未查询" },
+      daily_chat: { state: "idle", day: "2026-10-03", message: "尚未执行" },
     },
   ];
   const reload = vi.fn();
-  vi.mocked(useResource).mockReturnValue({ data: rows, reload, loading: false, error: null });
+  vi.mocked(useResource).mockReturnValue({
+    data: rows,
+    reload,
+    loading: false,
+    refreshing: false,
+    error: null,
+  });
   return { rows, reload };
 }
 
@@ -50,8 +71,17 @@ it("renders server preferences, allows international checkin opt-in, but never o
   });
   const post = vi.spyOn(api, "post");
   render(<Credentials />);
+  fireEvent.click(screen.getByRole("button", { name: "任务配置 cn.info" }));
+  expect(screen.getByText("目录已就绪")).toBeTruthy();
+  expect(screen.getByText("同步异常")).toBeTruthy();
   expect(screen.getByRole("switch", { name: "自动签到 cn.info" })).toHaveProperty("checked", true);
   expect(screen.getByRole("switch", { name: "自动旅行 cn.info" })).toHaveProperty("checked", true);
+  // The daily turn is international-only, so the domestic switch is shown but unusable.
+  expect(screen.getByRole("switch", { name: "自动活跃打卡 cn.info" })).toHaveProperty(
+    "disabled",
+    true,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "任务配置 intl.info" }));
   expect(screen.getByRole("switch", { name: "自动签到 intl.info" })).toHaveProperty(
     "checked",
     false,
@@ -61,6 +91,11 @@ it("renders server preferences, allows international checkin opt-in, but never o
     true,
   );
   expect(screen.queryByRole("button", { name: "旅行领派 intl.info" })).toBeNull();
+  expect(screen.getByRole("switch", { name: "自动活跃打卡 intl.info" })).toHaveProperty(
+    "checked",
+    false,
+  );
+  expect(screen.getByText("今日打卡：尚未执行")).toBeTruthy();
   await act(async () =>
     fireEvent.click(screen.getByRole("switch", { name: "自动签到 intl.info" })),
   );
@@ -69,19 +104,55 @@ it("renders server preferences, allows international checkin opt-in, but never o
     "checked",
     true,
   );
-  expect(screen.getByText(/保存不会立即领取/)).toBeTruthy();
+  expect(screen.getByText(/保存不会立即执行/)).toBeTruthy();
   expect(reload).toHaveBeenCalled();
   post.mockClear();
+  // Opting into the daily turn only persists; the sweep decides when the turn runs.
+  await act(async () =>
+    fireEvent.click(screen.getByRole("switch", { name: "自动活跃打卡 intl.info" })),
+  );
+  expect(patch).toHaveBeenLastCalledWith("/credentials/intl", { auto_daily_chat: true });
+  expect(post).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "任务配置 cn.info" }));
   await act(async () => fireEvent.click(screen.getByRole("switch", { name: "自动旅行 cn.info" })));
   expect(patch).toHaveBeenLastCalledWith("/credentials/cn", { auto_travel: false });
   expect(screen.getByRole("switch", { name: "自动签到 cn.info" })).toHaveProperty("checked", true);
   expect(post).not.toHaveBeenCalled();
 });
 
+it("explains an enterprise account's travel exemption instead of blaming the region", async () => {
+  const { rows } = fixture();
+  // The growth center is personal-only, so the enterprise card must state the real reason.
+  rows.push({
+    id: "ent",
+    name: "ent.info",
+    profile: "cn-cli",
+    enabled: true,
+    health: "ready",
+    enterprise: true,
+    enterpriseName: "示例企业",
+    auto_checkin: true,
+    auto_travel: false,
+    travel_supported: false,
+    travel: { state: "unavailable", message: "企业账号不参与成长中心，无法旅行" },
+  });
+  render(<Credentials />);
+  fireEvent.click(screen.getByRole("button", { name: "任务配置 ent.info" }));
+  expect(screen.getByRole("switch", { name: "自动旅行 ent.info" })).toHaveProperty(
+    "disabled",
+    true,
+  );
+  expect(screen.getByText("企业账号不参与成长中心，无法旅行")).toBeTruthy();
+  // The manual travel actions are hidden, so no request can be sent for this account.
+  expect(screen.queryByRole("button", { name: "旅行领派 ent.info" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "旅行状态 ent.info" })).toBeNull();
+});
+
 it("does not pretend a failed or malformed save succeeded", async () => {
   fixture();
   const patch = vi.spyOn(api, "patch").mockResolvedValue({ data: { id: "intl", revision: 1 } });
   render(<Credentials />);
+  fireEvent.click(screen.getByRole("button", { name: "任务配置 intl.info" }));
   await act(async () =>
     fireEvent.click(screen.getByRole("switch", { name: "自动签到 intl.info" })),
   );
@@ -91,6 +162,7 @@ it("does not pretend a failed or malformed save succeeded", async () => {
     false,
   );
   patch.mockRejectedValueOnce(new Error("network unavailable"));
+  fireEvent.click(screen.getByRole("button", { name: "任务配置 cn.info" }));
   await act(async () => fireEvent.click(screen.getByRole("switch", { name: "自动旅行 cn.info" })));
   expect(screen.getByRole("switch", { name: "自动旅行 cn.info" })).toHaveProperty("checked", true);
 });
@@ -116,6 +188,7 @@ it("keeps manual checkin and travel separate from the automation preference writ
     ["旅行领派 cn.info", "/credentials/cn/travel"],
     ["签到 intl.info", "/credentials/intl/checkin"],
   ]) {
+    openRowMenu(label.split(" ").pop()!);
     await act(async () => fireEvent.click(screen.getByRole("button", { name: label })));
     expect(post).toHaveBeenLastCalledWith(
       path,
@@ -124,6 +197,7 @@ it("keeps manual checkin and travel separate from the automation preference writ
     );
   }
   expect(screen.getByText("部分完成")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "任务配置 intl.info" }));
   expect(screen.getByText(/签到活动未开放或已结束/)).toBeTruthy();
 });
 
@@ -145,6 +219,7 @@ it("shows partial completion when checkin is unavailable but departure succeeded
     },
   });
   render(<Credentials />);
+  openRowMenu("cn.info");
   await act(async () => fireEvent.click(screen.getByRole("button", { name: "签到 cn.info" })));
   expect(screen.getByText("部分完成")).toBeTruthy();
 });
@@ -154,9 +229,11 @@ it("disables switches when an older backend omits them and rejects malformed typ
     data: [{ id: "old", name: "old.info", enabled: true }],
     reload: vi.fn(),
     loading: false,
+    refreshing: false,
     error: null,
   });
   render(<Credentials />);
+  fireEvent.click(screen.getByRole("button", { name: "任务配置 old.info" }));
   expect(screen.getByRole("switch", { name: "自动签到 old.info" })).toHaveProperty(
     "disabled",
     true,
@@ -168,7 +245,7 @@ it("disables switches when an older backend omits them and rejects malformed typ
 
 it("shows server-provided travel locations and snapshot durations without triggering requests", () => {
   const { rows } = fixture();
-  Object.assign(rows[0].travel, {
+  Object.assign(rows[0].travel as Record<string, unknown>, {
     location_name: "海边书店",
     remaining_seconds: 3661,
     phase: "after_depart",
@@ -224,6 +301,7 @@ it("keeps confirmed departure visible when its status read fails", async () => {
     },
   });
   render(<Credentials />);
+  openRowMenu("cn.info");
   await act(async () => fireEvent.click(screen.getByRole("button", { name: "旅行领派 cn.info" })));
   expect(screen.getByText("部分完成")).toBeTruthy();
   expect(screen.getByText("派遣后核验")).toBeTruthy();
@@ -251,6 +329,7 @@ it("shows nested travel diagnostics independently from checkin", async () => {
     },
   });
   render(<Credentials />);
+  openRowMenu("cn.info");
   await act(async () => fireEvent.click(screen.getByRole("button", { name: "签到 cn.info" })));
   expect(screen.getByText("部分完成")).toBeTruthy();
   expect(screen.getByText("地点配置")).toBeTruthy();
@@ -273,4 +352,25 @@ it("does not invent a duration or a claimed credit amount", () => {
   expect(screen.queryByText(/积分数额未返回/)).toBeNull();
   rerender(<TravelSummary trip={{ state: "traveling", remaining_seconds: 0 }} />);
   expect(screen.getByText(/预计已到达，请查询核验/)).toBeTruthy();
+});
+
+it("reports a batch run as a toast that lists only the unfinished accounts", async () => {
+  fixture();
+  const post = vi.spyOn(api, "post").mockResolvedValue({
+    data: {
+      results: [
+        { id: "cn", name: "cn.info", ok: true, message: "余额、目录和用量已同步" },
+        { id: "intl", name: "intl.info", ok: false, message: "操作失败（RuntimeError）" },
+      ],
+    },
+  });
+  render(<Credentials />);
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "同步全部余额" })));
+  expect(post).toHaveBeenLastCalledWith("/sync", undefined, expect.anything());
+  expect(screen.getByText("已完成 1 · 未完成 1")).toBeTruthy();
+  expect(screen.getByText("操作失败（RuntimeError）")).toBeTruthy();
+  expect(screen.queryByText("余额、目录和用量已同步")).toBeNull();
+  // Refreshing the list clears the report along with the stale rows.
+  fireEvent.click(screen.getByRole("button", { name: "刷新列表" }));
+  expect(screen.queryByText("已完成 1 · 未完成 1")).toBeNull();
 });

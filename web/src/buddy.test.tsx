@@ -1,8 +1,17 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vite-plus/test";
 import { Buddy, buddyConfirmation } from "./Buddy";
 import { Credentials } from "./pages/Credentials";
 import { api, useResource } from "./api";
+
+function openRowMenu(credentialName: string) {
+  const row = screen
+    .getAllByText(credentialName)
+    .map((el) => el.closest<HTMLElement>("tr, article"))
+    .find((tr) => tr && within(tr).queryByRole("button", { name: /^更多/ }));
+  if (!row) throw new Error(`row for ${credentialName} not found`);
+  fireEvent.click(within(row).getByRole("button", { name: /^更多/ }));
+}
 
 vi.mock("./api", async (original) => ({
   ...(await original<typeof import("./api")>()),
@@ -139,6 +148,7 @@ it("opens confirmation only from a scoped manual travel result", async () => {
   vi.mocked(useResource).mockReturnValue({
     data: [credential],
     loading: false,
+    refreshing: false,
     error: null,
     reload: vi.fn(),
   });
@@ -148,6 +158,7 @@ it("opens confirmation only from a scoped manual travel result", async () => {
     },
   });
   render(<Credentials />);
+  openRowMenu("cn.info");
   await act(async () => fireEvent.click(screen.getByRole("button", { name: "旅行领派 cn.info" })));
   expect(screen.getByRole("dialog")).toBeTruthy();
   expect(screen.getByRole("checkbox", { name: /我已阅读并同意/ })).toHaveProperty(
@@ -185,6 +196,7 @@ it("shows partial completion when checkin succeeds but Buddy prerequisites block
   vi.mocked(useResource).mockReturnValue({
     data: [credential],
     loading: false,
+    refreshing: false,
     error: null,
     reload: vi.fn(),
   });
@@ -203,6 +215,7 @@ it("shows partial completion when checkin succeeds but Buddy prerequisites block
     },
   });
   render(<Credentials />);
+  openRowMenu("cn.info");
   await act(async () => fireEvent.click(screen.getByRole("button", { name: "签到 cn.info" })));
   expect(screen.getByText("部分完成")).toBeTruthy();
   expect(screen.queryByText("已完成")).toBeNull();
