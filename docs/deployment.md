@@ -172,10 +172,10 @@ This command explicitly uses the default port and directory, not Compose-specifi
 
 ## Rakserver production deployment
 
-After CI passes on `main` in the private repository `ccfwwm/codebuddy2api-private`, the workflow builds and publishes a GHCR image, then deploys its immutable digest through a restricted SSH command. The server recreates the `codebuddy2api` container and persists its data in `/opt/codebuddy2api/auth`; GitHub Actions does not upload application credentials.
+After CI passes on `main` in the deployment repository `ccfwwm/codebuddy2api-private` (now public), the workflow builds and publishes a GHCR image, then deploys its immutable digest through a restricted SSH command. Standard GitHub-hosted runners can build this public repository without private-repository minutes. The server recreates the `codebuddy2api` container and persists its data in `/opt/codebuddy2api/auth`; GitHub Actions does not upload application credentials.
 
 The container joins `sub2api-deploy_sub2api-network`, where other containers can reach `http://codebuddy2api:8787`. The host publishes only `127.0.0.1:8787`, and Nginx serves `https://qqapi.aicodeme.xyz`.
 
 The WebUI uses `CODEBUDDY2API_KEY` as its login credential, without a separate username/password account. This key is stored in the root-only `/opt/codebuddy2api/.env` on the server; changing it requires logging in again. Preserve the entire `auth/` directory, including account credentials, during backups and upgrades.
 
-Keep production upgrades on this private image deployment workflow. The deployment script pulls and verifies the digest, stops this service, backs up the entire `auth/` directory, and recreates the container. Failed health checks restore the previous image and its matching data snapshot. Upgrades briefly interrupt service, so tests and image builds must finish first. WebUI in-place updates modify the container's writable layer and are lost when it is recreated; use the private image to manage the production version.
+Keep production upgrades on this CI image deployment workflow. The deployment script pulls and verifies the digest, stops this service, backs up the entire `auth/` directory, and recreates the container. Failed health checks restore the previous image and its matching data snapshot. Upgrades briefly interrupt service, so tests and image builds must finish first. WebUI in-place updates modify the container's writable layer and are lost when it is recreated; use the CI-built image to manage the production version.

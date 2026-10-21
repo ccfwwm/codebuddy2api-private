@@ -173,10 +173,10 @@ docker run -d --name codebuddy2api -p 127.0.0.1:8787:8787 \
 
 ## Rakserver 生产部署
 
-私有部署仓库 `ccfwwm/codebuddy2api-private` 的 `main` 分支每次通过 CI 后，会构建并发布 GHCR 镜像，再通过受限 SSH 命令部署镜像摘要。服务器仅重建 `codebuddy2api` 容器，持久数据保存在 `/opt/codebuddy2api/auth`；GitHub Actions 不上传应用凭据。
+部署仓库 `ccfwwm/codebuddy2api-private`（现为公开仓库）的 `main` 分支每次通过 CI 后，会构建并发布 GHCR 镜像，再通过受限 SSH 命令部署镜像摘要。公开仓库可使用标准 GitHub 托管 runner 构建，不消耗私有仓库分钟数。服务器仅重建 `codebuddy2api` 容器，持久数据保存在 `/opt/codebuddy2api/auth`；GitHub Actions 不上传应用凭据。
 
 生产容器名为 `codebuddy2api`，加入 `sub2api-deploy_sub2api-network`。同一网络中的容器可用 `http://codebuddy2api:8787` 访问。宿主机只在 `127.0.0.1:8787` 发布端口，由 Nginx 提供 `https://qqapi.aicodeme.xyz`。
 
 WebUI 没有单独的用户名密码账号，使用 `CODEBUDDY2API_KEY` 登录。该密钥保存在服务器 `/opt/codebuddy2api/.env`，权限为 root-only；更换后需要用新密钥重新登录。账号凭证保存在 `auth/`，备份和升级时须保留整个目录。
 
-生产升级沿用私有仓库的镜像部署流程。部署脚本先拉取并核对镜像摘要，再停止此服务、备份整个 `auth/` 目录并重建容器；健康检查失败时恢复旧镜像和对应数据快照。升级会造成短暂停机，应先完成测试和镜像构建。WebUI 的就地更新只修改容器可写层，重建容器后会丢失，因此生产版本应通过私有镜像统一更新。
+生产升级沿用 CI 镜像部署流程。部署脚本先拉取并核对镜像摘要，再停止此服务、备份整个 `auth/` 目录并重建容器；健康检查失败时恢复旧镜像和对应数据快照。升级会造成短暂停机，应先完成测试和镜像构建。WebUI 的就地更新只修改容器可写层，重建容器后会丢失，因此生产版本应通过 CI 构建的镜像统一更新。
