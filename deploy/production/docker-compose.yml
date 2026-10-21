@@ -15,6 +15,8 @@ services:
       CODEBUDDY2API_ALLOW_OPEN_NOAUTH: "false"
       CODEBUDDY2API_ADMIN_CSRF: "true"
       CODEBUDDY2API_ADMIN_ORIGINS: https://qqapi.aicodeme.xyz
+      # Trust only the host-side Nginx proxy through this Docker network gateway.
+      FORWARDED_ALLOW_IPS: "127.0.0.1,::1,192.168.64.1"
     command:
       - python3
       - converter.py

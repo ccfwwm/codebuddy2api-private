@@ -176,6 +176,8 @@ After CI passes on `main` in the deployment repository `ccfwwm/codebuddy2api-pri
 
 The container joins `sub2api-deploy_sub2api-network`, where other containers can reach `http://codebuddy2api:8787`. The host publishes only `127.0.0.1:8787`, and Nginx serves `https://qqapi.aicodeme.xyz`.
 
+The production Compose file trusts forwarded headers only from loopback and the Docker network gateway `192.168.64.1`. This lets the gateway recognize Nginx's HTTPS requests and issue Secure management-session cookies. If this network is recreated with another gateway, update `FORWARDED_ALLOW_IPS` to match.
+
 The WebUI uses `CODEBUDDY2API_KEY` as its login credential, without a separate username/password account. This key is stored in the root-only `/opt/codebuddy2api/.env` on the server; changing it requires logging in again. Preserve the entire `auth/` directory, including account credentials, during backups and upgrades.
 
 Keep production upgrades on this CI image deployment workflow. The deployment script pulls and verifies the digest, stops this service, backs up the entire `auth/` directory, and recreates the container. Failed health checks restore the previous image and its matching data snapshot. Upgrades briefly interrupt service, so tests and image builds must finish first. WebUI in-place updates modify the container's writable layer and are lost when it is recreated; use the CI-built image to manage the production version.

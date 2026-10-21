@@ -177,6 +177,8 @@ docker run -d --name codebuddy2api -p 127.0.0.1:8787:8787 \
 
 生产容器名为 `codebuddy2api`，加入 `sub2api-deploy_sub2api-network`。同一网络中的容器可用 `http://codebuddy2api:8787` 访问。宿主机只在 `127.0.0.1:8787` 发布端口，由 Nginx 提供 `https://qqapi.aicodeme.xyz`。
 
+生产 Compose 仅信任回环地址和 Docker 网络网关 `192.168.64.1` 的转发头，使应用能够识别 Nginx 转发的 HTTPS 请求，并为管理会话 Cookie 添加 Secure 标志。如果重建网络后网关地址变化，需要同步修改 `FORWARDED_ALLOW_IPS`。
+
 WebUI 没有单独的用户名密码账号，使用 `CODEBUDDY2API_KEY` 登录。该密钥保存在服务器 `/opt/codebuddy2api/.env`，权限为 root-only；更换后需要用新密钥重新登录。账号凭证保存在 `auth/`，备份和升级时须保留整个目录。
 
 生产升级沿用 CI 镜像部署流程。部署脚本先拉取并核对镜像摘要，再停止此服务、备份整个 `auth/` 目录并重建容器；健康检查失败时恢复旧镜像和对应数据快照。升级会造成短暂停机，应先完成测试和镜像构建。WebUI 的就地更新只修改容器可写层，重建容器后会丢失，因此生产版本应通过 CI 构建的镜像统一更新。
