@@ -179,6 +179,26 @@ docker run -d --name codebuddy2api -p 127.0.0.1:8787:8787 \
 
 生产 Compose 仅信任回环地址和 Docker 网络网关 `192.168.64.1` 的转发头，使应用能够识别 Nginx 转发的 HTTPS 请求，并为管理会话 Cookie 添加 Secure 标志。如果重建网络后网关地址变化，需要同步修改 `FORWARDED_ALLOW_IPS`。
 
+额外信任的管理来源 `https://qqapi.aicodeme.xyz` 保存在 `auth/control.sqlite3`，可直接在 WebUI 中修改。不要再向 Compose 或容器环境中加入 `CODEBUDDY2API_ADMIN_ORIGINS`：环境变量即使已迁移，也会继续覆盖配置库并锁定该项。密钥、路径及代理信任仍由部署配置管理。
+
+如果现有部署还在注入这个变量，须先使用旧 Compose 迁移实际生效的值，再移除变量。下面的命令在 Rakserver 上执行，不是在 Windows 项目目录执行：
+
+```bash
+cd /opt/codebuddy2api
+docker compose --env-file .env stop codebuddy2api
+# 先完整备份 auth/ 目录，备份仅限 root 读取，并验证备份可读。
+docker compose --env-file .env run --rm --no-deps --pull never codebuddy2api \
+  python3 converter.py config migrate --no-env --data-dir /data/auth \
+  --keys admin_allowed_origins --dry-run
+docker compose --env-file .env run --rm --no-deps --pull never codebuddy2api \
+  python3 converter.py config migrate --no-env --data-dir /data/auth \
+  --keys admin_allowed_origins
+# 从 Compose 及其他环境来源中移除 CODEBUDDY2API_ADMIN_ORIGINS。
+docker compose --env-file .env up -d --no-deps --pull never codebuddy2api
+```
+
+容器停止后不能用 `docker exec` 执行命令，也不要用 `--force` 绕过运行中实例检查。完成后确认 `/admin/settings` 中 `admin_allowed_origins` 的来源为 `management`、`locked` 为 `false`，并验证管理登录正常。
+
 WebUI 没有单独的用户名密码账号，使用 `CODEBUDDY2API_KEY` 登录。该密钥保存在服务器 `/opt/codebuddy2api/.env`，权限为 root-only；更换后需要用新密钥重新登录。账号凭证保存在 `auth/`，备份和升级时须保留整个目录。
 
 生产升级沿用 CI 镜像部署流程。部署脚本先拉取并核对镜像摘要，再停止此服务、备份整个 `auth/` 目录并重建容器；健康检查失败时恢复旧镜像和对应数据快照。升级会造成短暂停机，应先完成测试和镜像构建。WebUI 的就地更新只修改容器可写层，重建容器后会丢失，因此生产版本应通过 CI 构建的镜像统一更新。

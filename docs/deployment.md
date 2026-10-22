@@ -178,6 +178,26 @@ The container joins `sub2api-deploy_sub2api-network`, where other containers can
 
 The production Compose file trusts forwarded headers only from loopback and the Docker network gateway `192.168.64.1`. This lets the gateway recognize Nginx's HTTPS requests and issue Secure management-session cookies. If this network is recreated with another gateway, update `FORWARDED_ALLOW_IPS` to match.
 
+The extra trusted management origin `https://qqapi.aicodeme.xyz` is stored in `auth/control.sqlite3`, where it remains editable in the WebUI. Do not reintroduce `CODEBUDDY2API_ADMIN_ORIGINS` in Compose or the container environment: an environment override locks the field even after migration. Keep the API key, paths and proxy trust in the deployment configuration.
+
+For an existing deployment that still injects this variable, use the old Compose file to migrate its effective value **before** removing the variable. Run these commands on Rakserver, not on the Windows checkout:
+
+```bash
+cd /opt/codebuddy2api
+docker compose --env-file .env stop codebuddy2api
+# Create and verify a root-only backup of the entire auth/ directory first.
+docker compose --env-file .env run --rm --no-deps --pull never codebuddy2api \
+  python3 converter.py config migrate --no-env --data-dir /data/auth \
+  --keys admin_allowed_origins --dry-run
+docker compose --env-file .env run --rm --no-deps --pull never codebuddy2api \
+  python3 converter.py config migrate --no-env --data-dir /data/auth \
+  --keys admin_allowed_origins
+# Remove CODEBUDDY2API_ADMIN_ORIGINS from Compose and any environment source.
+docker compose --env-file .env up -d --no-deps --pull never codebuddy2api
+```
+
+Do not use `docker exec` after stopping the container or bypass the running-instance check with `--force`. Verify that `/admin/settings` reports `source: management` and `locked: false` for `admin_allowed_origins`, and that management login still works.
+
 The WebUI uses `CODEBUDDY2API_KEY` as its login credential, without a separate username/password account. This key is stored in the root-only `/opt/codebuddy2api/.env` on the server; changing it requires logging in again. Preserve the entire `auth/` directory, including account credentials, during backups and upgrades.
 
 Keep production upgrades on this CI image deployment workflow. The deployment script pulls and verifies the digest, stops this service, backs up the entire `auth/` directory, and recreates the container. Failed health checks restore the previous image and its matching data snapshot. Upgrades briefly interrupt service, so tests and image builds must finish first. WebUI in-place updates modify the container's writable layer and are lost when it is recreated; use the CI-built image to manage the production version.
